@@ -52,6 +52,44 @@ export async function getFriends(
   return result.results;
 }
 
+/**
+ * 指定 LINE アカウント内で、指定タグを持ち、現在 friend 状態 (is_following = 1)
+ * の友だちの line_user_id 配列を返す。リッチメニューの bulk link 用。
+ *
+ * - tagId が省略された場合は account 内全員の following を返す
+ * - line_user_id は LINE bulk link API の userIds に直接渡す形式 (U... 始まり)
+ * - 重複は無いはず (friends.line_user_id は UNIQUE)
+ */
+export async function getFollowingLineUserIdsByTag(
+  db: D1Database,
+  accountId: string,
+  tagId: string | null,
+): Promise<string[]> {
+  if (tagId) {
+    const result = await db
+      .prepare(
+        `SELECT DISTINCT f.line_user_id
+           FROM friends f
+           INNER JOIN friend_tags ft ON ft.friend_id = f.id
+          WHERE ft.tag_id = ?
+            AND f.line_account_id = ?
+            AND f.is_following = 1`,
+      )
+      .bind(tagId, accountId)
+      .all<{ line_user_id: string }>();
+    return (result.results ?? []).map((r) => r.line_user_id);
+  }
+  const result = await db
+    .prepare(
+      `SELECT line_user_id
+         FROM friends
+        WHERE line_account_id = ? AND is_following = 1`,
+    )
+    .bind(accountId)
+    .all<{ line_user_id: string }>();
+  return (result.results ?? []).map((r) => r.line_user_id);
+}
+
 export async function getFriendByLineUserId(
   db: D1Database,
   lineUserId: string,

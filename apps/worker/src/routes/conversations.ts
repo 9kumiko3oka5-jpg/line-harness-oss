@@ -21,10 +21,13 @@ conversations.get('/api/conversations', async (c) => {
         : '';
 
     const sql = `
+      -- conversations queue (要対応の自発メッセージ) は postback (rich menu tap) を除外する。
+      -- postback は button 押下で「人間の返信を要する自発メッセージ」ではないため。
       WITH last_incoming AS (
         SELECT friend_id, MAX(created_at) AS at
         FROM messages_log
         WHERE direction = 'incoming'
+          AND (source IS NULL OR source != 'postback')
         GROUP BY friend_id
       ),
       last_human AS (
@@ -38,10 +41,13 @@ conversations.get('/api/conversations', async (c) => {
         FROM messages_log ml
         INNER JOIN (
           SELECT friend_id, MAX(created_at) AS mx
-          FROM messages_log WHERE direction = 'incoming'
+          FROM messages_log
+          WHERE direction = 'incoming'
+            AND (source IS NULL OR source != 'postback')
           GROUP BY friend_id
         ) lm ON lm.friend_id = ml.friend_id AND lm.mx = ml.created_at
         WHERE ml.direction = 'incoming'
+          AND (ml.source IS NULL OR ml.source != 'postback')
       )
       SELECT
         f.id AS friend_id,
@@ -80,7 +86,9 @@ conversations.get('/api/conversations', async (c) => {
     const countSql = `
       WITH last_incoming AS (
         SELECT friend_id, MAX(created_at) AS at FROM messages_log
-        WHERE direction = 'incoming' GROUP BY friend_id
+        WHERE direction = 'incoming'
+          AND (source IS NULL OR source != 'postback')
+        GROUP BY friend_id
       ),
       last_human AS (
         SELECT friend_id, MAX(created_at) AS at FROM messages_log

@@ -387,10 +387,22 @@ export default function AutomationsPage() {
               </div>
 
               {/* Meta info */}
-              <div className="flex items-center gap-4 text-xs text-gray-400 mb-3">
-                <span>アクション: {automation.actions.length}件</span>
-                <span>優先度: {automation.priority}</span>
-              </div>
+              {(() => {
+                const sendMsgWithTpl = automation.actions.filter(
+                  (a) => a.type === 'send_message' && (a.params as { template_id?: string }).template_id,
+                ).length
+                return (
+                  <div className="flex items-center gap-4 text-xs text-gray-400 mb-3">
+                    <span>アクション: {automation.actions.length}件</span>
+                    {sendMsgWithTpl > 0 && (
+                      <a href="/templates" className="text-blue-600 hover:underline" title="template_id 参照を含む send_message action あり">
+                        🔗 template×{sendMsgWithTpl}
+                      </a>
+                    )}
+                    <span>優先度: {automation.priority}</span>
+                  </div>
+                )
+              })()}
 
               {/* Actions */}
               <div className="flex items-center justify-end gap-2 pt-2 border-t border-gray-100">

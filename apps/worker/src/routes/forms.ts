@@ -1,6 +1,7 @@
 import { Hono } from 'hono';
 import {
   getForms,
+  getFormsWithStats,
   getFormById,
   createForm,
   updateForm,
@@ -11,12 +12,19 @@ import {
 } from '@line-crm/db';
 import { getFriendByLineUserId, getFriendById } from '@line-crm/db';
 import { addTagToFriend, enrollFriendInScenario } from '@line-crm/db';
-import type { Form as DbForm, FormSubmission as DbFormSubmission } from '@line-crm/db';
+import type {
+  Form as DbForm,
+  FormSubmission as DbFormSubmission,
+  FormUsedByAccount,
+} from '@line-crm/db';
 import type { Env } from '../index.js';
 
 const forms = new Hono<Env>();
 
-function serializeForm(row: DbForm) {
+function serializeForm(
+  row: DbForm,
+  extra?: { lastSubmittedAt?: string | null; usedByAccounts?: FormUsedByAccount[] },
+) {
   return {
     id: row.id,
     name: row.name,
@@ -34,6 +42,8 @@ function serializeForm(row: DbForm) {
     submitCount: row.submit_count,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
+    lastSubmittedAt: extra?.lastSubmittedAt ?? null,
+    usedByAccounts: extra?.usedByAccounts ?? [],
   };
 }
 
@@ -48,11 +58,19 @@ function serializeSubmission(row: DbFormSubmission & { friend_name?: string | nu
   };
 }
 
-// GET /api/forms — list all forms
+// GET /api/forms — list all forms (with submission stats + delivering accounts)
 forms.get('/api/forms', async (c) => {
   try {
-    const items = await getForms(c.env.DB);
-    return c.json({ success: true, data: items.map(serializeForm) });
+    const items = await getFormsWithStats(c.env.DB);
+    return c.json({
+      success: true,
+      data: items.map((row) =>
+        serializeForm(row, {
+          lastSubmittedAt: row.last_submitted_at,
+          usedByAccounts: row.used_by_accounts,
+        }),
+      ),
+    });
   } catch (err) {
     console.error('GET /api/forms error:', err);
     return c.json({ success: false, error: 'Internal server error' }, 500);

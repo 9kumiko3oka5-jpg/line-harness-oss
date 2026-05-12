@@ -6,6 +6,24 @@ export async function authMiddleware(c: Context<Env>, next: Next): Promise<Respo
   // Skip auth for the LINE webhook endpoint — it uses signature verification instead
   // Skip auth for OpenAPI docs — public documentation
   const path = new URL(c.req.url).pathname;
+  // LIFF / admin の SPA アセットは Authorization ヘッダなしで HTML を取りに
+  // くる。Worker は API 以外のパスを ASSETS バインディングから配信するので、
+  // /api/ で始まらないパスは認証 skip して static asset として返す。
+  // (admin は別ホスト、Worker の non-API path はすべて LIFF/SPA 経由)
+  if (!path.startsWith('/api/')) {
+    // ただし内部用エンドポイント (/webhook, /auth, /setup) は元の skip 判定に任せる
+    if (
+      path !== '/webhook' &&
+      !path.startsWith('/auth/') &&
+      path !== '/setup' &&
+      !path.startsWith('/t/') &&
+      !path.startsWith('/r/') &&
+      !path.startsWith('/pool/') &&
+      !path.startsWith('/images/')
+    ) {
+      return next();
+    }
+  }
   if (
     path === '/webhook' ||
     path === '/docs' ||
@@ -15,6 +33,12 @@ export async function authMiddleware(c: Context<Env>, next: Next): Promise<Respo
     path.startsWith('/r/') ||
     path.startsWith('/pool/') ||
     path.startsWith('/images/') ||
+    // 画像 src として <img> 経由でブラウザが取得するため (Authorization ヘッダ不可)。
+    // R2 key 内に group_id / page_id (UUID) が含まれるので推測困難。draft 画像も
+    // 最終的に LINE 上で公開されるため機密性は低い。
+    path.startsWith('/api/rich-menu-images/') ||
+    // LINE 上 rich menu 画像 proxy (Authorization ヘッダなしで <img src> 経由表示)
+    path.match(/^\/api\/rich-menu-groups\/external\/[^/]+\/image$/) ||
     path.startsWith('/api/liff/') ||
     path.startsWith('/auth/') ||
     path === '/setup' ||

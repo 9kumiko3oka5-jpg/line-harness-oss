@@ -23,7 +23,7 @@ binding = "IMAGES"
 bucket_name = "line-harness-images"
 
 [triggers]
-crons = ["*/5 * * * *"]
+crons = ["*/5 * * * *", "0 */6 * * *"]
 
 # ═══════════════════════════════════════════════════════════════
 # 本番環境 (aiagent.mini@)
@@ -47,4 +47,4 @@ binding = "IMAGES"
 bucket_name = "line-harness-images"
 
 [env.production.triggers]
-crons = ["*/5 * * * *"]
+crons = ["*/5 * * * *", "0 */6 * * *"]

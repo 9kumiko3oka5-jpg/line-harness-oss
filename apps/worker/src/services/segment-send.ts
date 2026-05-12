@@ -82,11 +82,13 @@ export async function processSegmentSend(
         successCount += batch.length;
 
         // Log successfully sent messages (batch insert for performance)
+        // line_account_id は broadcast 設定時の固定値を記録 (送信時点のチャネル).
+        const segmentBroadcastAccount = (broadcast as unknown as Record<string, unknown>).line_account_id as string | null;
         const logStmts = batch.map(friend =>
           db.prepare(
-            `INSERT INTO messages_log (id, friend_id, direction, message_type, content, broadcast_id, scenario_step_id, source, created_at)
-             VALUES (?, ?, 'outgoing', ?, ?, ?, NULL, 'broadcast', ?)`,
-          ).bind(crypto.randomUUID(), friend.id, broadcast.message_type, broadcast.message_content, broadcastId, now),
+            `INSERT INTO messages_log (id, friend_id, direction, message_type, content, broadcast_id, scenario_step_id, source, line_account_id, created_at)
+             VALUES (?, ?, 'outgoing', ?, ?, ?, NULL, 'broadcast', ?, ?)`,
+          ).bind(crypto.randomUUID(), friend.id, broadcast.message_type, broadcast.message_content, broadcastId, segmentBroadcastAccount, now),
         );
         await db.batch(logStmts);
       } catch (err) {

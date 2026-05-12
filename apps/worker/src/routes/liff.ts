@@ -12,7 +12,9 @@ import {
   getLineAccountById,
   getLineAccounts,
   getTrafficPoolBySlug,
+  getTrafficPoolById,
   getRandomPoolAccount,
+  getPoolAccounts,
   getTrackedLinkById,
   getMessageTemplateById,
   jstNow,
@@ -135,15 +137,30 @@ async function applyRefAttribution(
       const {
         enrollFriendInScenario,
         getScenarioSteps,
+        getScenarioById,
         advanceFriendScenario,
         completeFriendScenario,
         getFriendById,
+        computeNextDeliveryAt,
+        resolveStepContent,
+        addTagToFriend,
       } = await import('@line-crm/db');
       const { LineClient } = await import('@line-crm/line-sdk');
       const { buildMessage, expandVariables, resolveMetadata } = await import('../services/step-delivery.js');
-      const steps = await getScenarioSteps(db, effectiveScenarioId);
+      const scenarioRow = await getScenarioById(db, effectiveScenarioId);
+      if (!scenarioRow) return;
+      const steps = scenarioRow.steps;
       const firstStep = steps[0];
-      if (!firstStep || firstStep.delay_minutes !== 0) return;
+      // クリックキャンペーンの即時送信は「now 以前にスケジュールされる」場合のみ。
+      // elapsed/absolute_time の delay_minutes=0 は即時を意味しない（offset/clock-time 起点）。
+      if (!firstStep) return;
+      const enrolledAtJst = new Date(Date.now() + 9 * 60 * 60_000);
+      const firstScheduledAt = computeNextDeliveryAt(
+        { delivery_mode: scenarioRow.delivery_mode ?? 'relative' },
+        firstStep,
+        { enrolledAt: enrolledAtJst, previousDeliveredAt: enrolledAtJst, now: enrolledAtJst },
+      );
+      if (firstScheduledAt.getTime() > enrolledAtJst.getTime()) return;
 
       // Cooldown FIRST, before enrolling. /api/liff/link is hit on every
       // LIFF page load (refresh, back-nav), not only on a fresh
@@ -189,12 +206,14 @@ async function applyRefAttribution(
         user_id: (fresh as unknown as Record<string, string | null>).user_id,
         metadata: (fresh as unknown as Record<string, string | null>).metadata,
       });
+      // Resolve template_id → templates table (参照型)
+      const resolved = await resolveStepContent(db, firstStep);
       const expanded = expandVariables(
-        firstStep.message_content,
+        resolved.messageContent,
         { ...fresh, metadata: resolvedMeta } as Parameters<typeof expandVariables>[1],
         c.env.WORKER_URL,
       );
-      const pushedMessage = buildMessage(firstStep.message_type, expanded);
+      const pushedMessage = buildMessage(resolved.messageType, expanded);
       await lineClient.pushMessage(lineUserId, [pushedMessage]);
 
       // Log the push so the cooldown above sees it on subsequent calls,
@@ -208,8 +227,8 @@ async function applyRefAttribution(
       const liffLogPayload = messageToLogPayload(pushedMessage);
       await db
         .prepare(
-          `INSERT INTO messages_log (id, friend_id, direction, message_type, content, broadcast_id, scenario_step_id, source, created_at)
-           VALUES (?, ?, 'outgoing', ?, ?, NULL, ?, 'scenario', ?)`,
+          `INSERT INTO messages_log (id, friend_id, direction, message_type, content, broadcast_id, scenario_step_id, source, template_id_at_send, created_at)
+           VALUES (?, ?, 'outgoing', ?, ?, NULL, ?, 'scenario', ?, ?)`,
         )
         .bind(
           crypto.randomUUID(),
@@ -217,6 +236,7 @@ async function applyRefAttribution(
           liffLogPayload.messageType,
           liffLogPayload.content,
           firstStep.id,
+          resolved.templateIdAtSend,
           nowIso,
         )
         .run();
@@ -239,12 +259,12 @@ async function applyRefAttribution(
       if (enrollmentRow && enrollmentRow.current_step_order < firstStep.step_order) {
         const nextStep = steps[1];
         if (nextStep) {
-          const next = new Date(Date.now() + 9 * 60 * 60_000 + nextStep.delay_minutes * 60_000);
-          const hours = next.getUTCHours();
-          if (hours < 9 || hours >= 21) {
-            if (hours >= 21) next.setUTCDate(next.getUTCDate() + 1);
-            next.setUTCHours(9, 0, 0, 0);
-          }
+          // step 2 も computeNextDeliveryAt で計算（elapsed/absolute_time で正しい時刻に）
+          const next = computeNextDeliveryAt(
+            { delivery_mode: scenarioRow.delivery_mode ?? 'relative' },
+            nextStep,
+            { enrolledAt: enrolledAtJst, previousDeliveredAt: enrolledAtJst, now: enrolledAtJst },
+          );
           await advanceFriendScenario(
             db,
             enrollmentRow.id,
@@ -253,6 +273,14 @@ async function applyRefAttribution(
           );
         } else {
           await completeFriendScenario(db, enrollmentRow.id);
+        }
+        // 到達タグ付与 (advance / complete の後)
+        if (firstStep.on_reach_tag_id) {
+          try {
+            await addTagToFriend(db, friend.id, firstStep.on_reach_tag_id);
+          } catch (err) {
+            console.error(`[scenario] tag attach failed step=${firstStep.id}:`, err);
+          }
         }
       }
     } catch (err) {
@@ -294,10 +322,29 @@ liffRoutes.get('/auth/line', async (c) => {
   const ua = c.req.header('user-agent') || '';
 
   // Multi-account: resolve LINE Login channel + LIFF
-  // Priority: ?account= param > traffic pool "main" > env default
+  // Priority:
+  //   1. entry_route.pool_id (when ref resolves to a referral link)
+  //   2. ?account= explicit single-account override
+  //   3. ?pool= explicit override
+  //   4. 'main' traffic pool fallback
+  //   5. env default
   let channelId = c.env.LINE_LOGIN_CHANNEL_ID;
   let liffUrl = c.env.LIFF_URL;
-  if (accountParam) {
+
+  // 1. entry_route → pool_id. getTrafficPoolById skips the is_active check
+  // that getTrafficPoolBySlug does for us, so we filter disabled pools here
+  // to honor an operator pause.
+  let resolvedPool: Awaited<ReturnType<typeof getTrafficPoolBySlug>> | null = null;
+  if (ref) {
+    const route = await getEntryRouteByRefCode(c.env.DB, ref);
+    if (route?.pool_id) {
+      const candidate = await getTrafficPoolById(c.env.DB, route.pool_id);
+      if (candidate?.is_active) resolvedPool = candidate;
+    }
+  }
+
+  if (!resolvedPool && accountParam) {
+    // 2. ?account= explicit override
     const account = await getLineAccountByChannelId(c.env.DB, accountParam);
     if (account?.login_channel_id) {
       channelId = account.login_channel_id;
@@ -306,27 +353,24 @@ liffRoutes.get('/auth/line', async (c) => {
       liffUrl = `https://liff.line.me/${account.liff_id}`;
     }
   } else {
-    // Traffic pool: pick random account from pool for distribution
-    // NOTE: accountParam is NOT set here — setting it triggers the cross-account
-    // OAuth guard (L123) which skips LIFF on mobile. Pool is not cross-account.
-    // Instead, pool's channel_id goes into state only for callback to resolve.
-    const poolSlug = c.req.query('pool') || 'main';
-    const pool = await getTrafficPoolBySlug(c.env.DB, poolSlug);
-    if (pool) {
-      const account = await getRandomPoolAccount(c.env.DB, pool.id);
+    // 3 / 4: pool lookup (entry_route.pool_id wins over query)
+    if (!resolvedPool) {
+      const poolSlug = c.req.query('pool') || 'main';
+      resolvedPool = await getTrafficPoolBySlug(c.env.DB, poolSlug);
+    }
+    if (resolvedPool) {
+      const account = await getRandomPoolAccount(c.env.DB, resolvedPool.id);
       if (account) {
         if (account.login_channel_id) channelId = account.login_channel_id;
         if (account.liff_id) liffUrl = `https://liff.line.me/${account.liff_id}`;
         if (account.channel_id) poolAccount = account.channel_id;
       } else {
-        // Check if pool_accounts exist at all (vs all disabled)
-        const { getPoolAccounts } = await import('@line-crm/db');
-        const allAccounts = await getPoolAccounts(c.env.DB, pool.id);
+        const allAccounts = await getPoolAccounts(c.env.DB, resolvedPool.id);
         if (allAccounts.length === 0) {
           // No pool_accounts yet — fallback to active_account_id (migration period)
-          if (pool.login_channel_id) channelId = pool.login_channel_id;
-          if (pool.liff_id) liffUrl = `https://liff.line.me/${pool.liff_id}`;
-          if (pool.channel_id) poolAccount = pool.channel_id;
+          if (resolvedPool.login_channel_id) channelId = resolvedPool.login_channel_id;
+          if (resolvedPool.liff_id) liffUrl = `https://liff.line.me/${resolvedPool.liff_id}`;
+          if (resolvedPool.channel_id) poolAccount = resolvedPool.channel_id;
         } else {
           // All pool_accounts disabled — fail closed, don't leak to default account
           return c.text('このリンクは現在利用できません。しばらくしてからお試しください。', 503);
@@ -798,7 +842,14 @@ liffRoutes.get('/auth/callback', async (c) => {
       }
     }
 
-    // Auto-enroll in friend_add scenarios + immediate delivery (skip delivery window)
+    // Auto-enroll in friend_add scenarios + immediate delivery.
+    // Skip entirely when the referral link explicitly overrides account-level
+    // friend_add scenarios (entry_routes.run_account_friend_add_scenarios = 0).
+    const referralRouteForOverride =
+      ref && !ref.startsWith('xh:') ? await getEntryRouteByRefCode(db, ref) : null;
+    const runAccountScenariosLiff =
+      !referralRouteForOverride || referralRouteForOverride.run_account_friend_add_scenarios !== 0;
+
     try {
       const { getScenarios, enrollFriendInScenario: enroll, getScenarioSteps } = await import('@line-crm/db');
       const { LineClient } = await import('@line-crm/line-sdk');
@@ -817,24 +868,71 @@ liffRoutes.get('/auth/callback', async (c) => {
       }
       const lineClient = new LineClient(accessToken);
 
-      const scenarios = await getScenarios(db);
+      const {
+        computeNextDeliveryAt: computeNextLiff,
+        resolveStepContent: resolveStepLiff,
+        addTagToFriend: addTagLiff,
+      } = await import('@line-crm/db');
+      const scenarios = runAccountScenariosLiff ? await getScenarios(db) : [];
       for (const scenario of scenarios) {
         const scenarioAccountMatch = !scenario.line_account_id || !matchedAccountId || scenario.line_account_id === matchedAccountId;
         if (scenario.trigger_type === 'friend_add' && scenario.is_active && scenarioAccountMatch) {
           const enrollment = await enroll(db, friend.id, scenario.id);
           if (enrollment) {
-            // Immediate delivery of first step (skip delivery window)
+            // 即時送信は scenario.delivery_mode を踏まえて「now 以前にスケジュールされる」場合のみ。
+            // (relative+0min / elapsed+0d0m / absolute_time の過去時刻)
             const steps = await getScenarioSteps(db, scenario.id);
             const firstStep = steps[0];
-            if (firstStep && firstStep.delay_minutes === 0) {
-              const { resolveMetadata: resolveMetaLiff } = await import('../services/step-delivery.js');
-              const resolvedMetaLiff = await resolveMetaLiff(db, { user_id: (friend as unknown as Record<string, string | null>).user_id, metadata: (friend as unknown as Record<string, string | null>).metadata });
-              const expandedContent = expandVariables(
-                firstStep.message_content,
-                { ...friend, metadata: resolvedMetaLiff } as Parameters<typeof expandVariables>[1],
-                c.env.WORKER_URL,
+            if (firstStep) {
+              const enrolledAtJst = new Date(Date.now() + 9 * 60 * 60_000);
+              const firstScheduledAt = computeNextLiff(
+                { delivery_mode: scenario.delivery_mode ?? 'relative' },
+                firstStep,
+                { enrolledAt: enrolledAtJst, previousDeliveredAt: enrolledAtJst, now: enrolledAtJst },
               );
-              await lineClient.pushMessage(lineUserId, [buildMessage(firstStep.message_type, expandedContent)]);
+              if (firstScheduledAt.getTime() <= enrolledAtJst.getTime()) {
+                // Resolve template_id → templates table (参照型)
+                const resolved = await resolveStepLiff(db, firstStep);
+                const { resolveMetadata: resolveMetaLiff, messageToLogPayload } = await import('../services/step-delivery.js');
+                const resolvedMetaLiff = await resolveMetaLiff(db, { user_id: (friend as unknown as Record<string, string | null>).user_id, metadata: (friend as unknown as Record<string, string | null>).metadata });
+                const expandedContent = expandVariables(
+                  resolved.messageContent,
+                  { ...friend, metadata: resolvedMetaLiff } as Parameters<typeof expandVariables>[1],
+                  c.env.WORKER_URL,
+                );
+                const pushedMessage = buildMessage(resolved.messageType, expandedContent);
+                await lineClient.pushMessage(lineUserId, [pushedMessage]);
+
+                // messages_log への記録 (到達率分母に含めるため)
+                const oauthLogPayload = messageToLogPayload(pushedMessage);
+                const nowIso = new Date(Date.now() + 9 * 60 * 60_000)
+                  .toISOString()
+                  .slice(0, -1) + '+09:00';
+                await db
+                  .prepare(
+                    `INSERT INTO messages_log (id, friend_id, direction, message_type, content, broadcast_id, scenario_step_id, source, template_id_at_send, created_at)
+                     VALUES (?, ?, 'outgoing', ?, ?, NULL, ?, 'scenario', ?, ?)`,
+                  )
+                  .bind(
+                    crypto.randomUUID(),
+                    friend.id,
+                    oauthLogPayload.messageType,
+                    oauthLogPayload.content,
+                    firstStep.id,
+                    resolved.templateIdAtSend,
+                    nowIso,
+                  )
+                  .run();
+
+                // 到達タグ付与 (push 後)
+                if (firstStep.on_reach_tag_id) {
+                  try {
+                    await addTagLiff(db, friend.id, firstStep.on_reach_tag_id);
+                  } catch (err) {
+                    console.error(`[scenario] tag attach failed step=${firstStep.id}:`, err);
+                  }
+                }
+              }
             }
           }
         }
@@ -1224,18 +1322,24 @@ liffRoutes.get('/api/analytics/ref-summary', async (c) => {
     const accountFilter = lineAccountId ? 'AND f.line_account_id = ?' : '';
     const accountBinds = lineAccountId ? [lineAccountId] : [];
 
+    // friends 起点で集計することで、entry_routes に登録されていない ref
+    // (例えば X Harness が発行する UUID ref) も summary に拾えるようにする。
+    // 名前は entry_routes と LEFT JOIN して引く (未登録なら NULL → クライアン
+    // ト側で「(未登録)」と表示)。
     const rows = await db
       .prepare(
         `SELECT
-          er.ref_code,
-          er.name,
-          COUNT(DISTINCT rt.friend_id) as friend_count,
-          COUNT(rt.id) as click_count,
-          MAX(rt.created_at) as latest_at
-        FROM entry_routes er
-        LEFT JOIN ref_tracking rt ON er.ref_code = rt.ref_code
-        LEFT JOIN friends f ON f.id = rt.friend_id ${accountFilter ? `${accountFilter}` : ''}
-        GROUP BY er.ref_code, er.name
+          f.ref_code,
+          er.name as name,
+          COUNT(DISTINCT f.id) as friend_count,
+          COUNT(DISTINCT rt.id) as click_count,
+          MAX(f.created_at) as latest_at
+        FROM friends f
+        LEFT JOIN entry_routes er ON er.ref_code = f.ref_code
+        LEFT JOIN ref_tracking rt ON rt.ref_code = f.ref_code AND rt.friend_id = f.id
+        WHERE f.ref_code IS NOT NULL AND f.ref_code != ''
+          ${accountFilter ? `${accountFilter}` : ''}
+        GROUP BY f.ref_code, er.name
         ORDER BY friend_count DESC`,
       )
       .bind(...accountBinds)
@@ -1289,14 +1393,15 @@ liffRoutes.get('/api/analytics/ref/:refCode', async (c) => {
     const db = c.env.DB;
     const refCode = c.req.param('refCode');
 
+    // Look up the registered entry_route to surface the operator-facing name,
+    // but do NOT 404 when missing. /inflow-links surfaces refs that exist in
+    // the friends table but have never been registered (X Harness UUIDs,
+    // external campaign IDs, etc.) and we still want their friend list to
+    // expand — name just falls back to the raw ref_code in that case.
     const routeRow = await db
       .prepare(`SELECT ref_code, name FROM entry_routes WHERE ref_code = ?`)
       .bind(refCode)
       .first<{ ref_code: string; name: string }>();
-
-    if (!routeRow) {
-      return c.json({ success: false, error: 'Entry route not found' }, 404);
-    }
 
     const lineAccountId = c.req.query('lineAccountId');
     const accountFilter = lineAccountId ? 'AND f.line_account_id = ?' : '';
@@ -1325,8 +1430,8 @@ liffRoutes.get('/api/analytics/ref/:refCode', async (c) => {
     return c.json({
       success: true,
       data: {
-        refCode: routeRow.ref_code,
-        name: routeRow.name,
+        refCode: routeRow?.ref_code ?? refCode,
+        name: routeRow?.name ?? null,
         friends: (friends.results ?? []).map((f) => ({
           id: f.id,
           displayName: f.display_name,

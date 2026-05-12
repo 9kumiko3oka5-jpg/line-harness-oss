@@ -6,41 +6,44 @@
  * We extract this token and match friends across accounts to auto-tag duplicates.
  */
 
-/**
- * Map of line_account_id → duplicate tag ID.
- * Loaded from DB (account_settings key='duplicate_tag_mapping') at runtime.
- * Fallback to empty if not configured.
- */
-let cachedTagIds: Record<string, string> | null = null;
+import { URL_TOKEN_SQL } from '../lib/url-token.js';
 
-async function getTagIds(db: D1Database): Promise<Record<string, string>> {
-  if (cachedTagIds) return cachedTagIds;
-  const row = await db.prepare(
-    `SELECT value FROM account_settings WHERE line_account_id = 'system' AND key = 'duplicate_tag_mapping'`
-  ).first<{ value: string }>();
-  const result: Record<string, string> = row ? JSON.parse(row.value) : {};
-  cachedTagIds = result;
-  return result;
+interface DuplicateTagConfig {
+  /** Map of line_account_id → duplicate tag ID. */
+  tagIds: Record<string, string>;
+  /** tagId → { name, color } used by ensureTags. */
+  tagNames: Record<string, { name: string; color: string }>;
 }
 
 /**
- * Tag names/colors loaded from DB (account_settings key='duplicate_tag_names').
- * Format: { "tag-dup-xh1": { "name": "重複:XH1", "color": "#8B5CF6" }, ... }
+ * Load both account_settings rows in a single SELECT so a concurrent operator
+ * updating mapping + names cannot leave a cron tick with a mixed snapshot
+ * (e.g. new mapping, old names) — which would trip the friend_tags → tags FK.
+ *
+ * Read on every cron tick so DB-side updates take effect without redeploy.
  */
-let cachedTagNames: Record<string, { name: string; color: string }> | null = null;
+async function getDuplicateTagConfig(db: D1Database): Promise<DuplicateTagConfig> {
+  const result = await db.prepare(
+    `SELECT key, value FROM account_settings
+     WHERE line_account_id = 'system'
+       AND key IN ('duplicate_tag_mapping', 'duplicate_tag_names')`
+  ).all<{ key: string; value: string }>();
 
-async function getTagNames(db: D1Database): Promise<Record<string, { name: string; color: string }>> {
-  if (cachedTagNames) return cachedTagNames;
-  const row = await db.prepare(
-    `SELECT value FROM account_settings WHERE line_account_id = 'system' AND key = 'duplicate_tag_names'`
-  ).first<{ value: string }>();
-  const result: Record<string, { name: string; color: string }> = row ? JSON.parse(row.value) : {};
-  cachedTagNames = result;
-  return result;
+  const config: DuplicateTagConfig = { tagIds: {}, tagNames: {} };
+  for (const row of result.results ?? []) {
+    if (row.key === 'duplicate_tag_mapping') {
+      config.tagIds = JSON.parse(row.value);
+    } else if (row.key === 'duplicate_tag_names') {
+      config.tagNames = JSON.parse(row.value);
+    }
+  }
+  return config;
 }
 
-async function ensureTags(db: D1Database): Promise<void> {
-  const tagNames = await getTagNames(db);
+async function ensureTags(
+  db: D1Database,
+  tagNames: Record<string, { name: string; color: string }>
+): Promise<void> {
   if (Object.keys(tagNames).length === 0) return;
   const now = new Date(Date.now() + 9 * 60 * 60_000).toISOString().replace('Z', '+09:00');
   for (const [id, { name, color }] of Object.entries(tagNames)) {
@@ -50,28 +53,26 @@ async function ensureTags(db: D1Database): Promise<void> {
   }
 }
 
-const URL_TOKEN_SQL = `
-  CASE
-    WHEN picture_url LIKE 'https://sprofile.line-scdn.net/%' THEN SUBSTR(picture_url, 42, 80)
-    WHEN picture_url LIKE 'https://profile.line-scdn.net/%' THEN SUBSTR(picture_url, 41, 80)
-    ELSE NULL
-  END
-`;
-
 /**
  * Detect duplicate friends across all accounts and auto-tag them.
  * Runs incrementally — only processes friends updated since last run.
  */
 export async function processDuplicateDetection(db: D1Database): Promise<void> {
-  // Load tag mapping from DB
-  const tagIds = await getTagIds(db);
+  // Load tag mapping + names atomically (single SELECT) so they cannot drift
+  // mid-update.
+  const { tagIds, tagNames } = await getDuplicateTagConfig(db);
   if (Object.keys(tagIds).length === 0) {
-    // No mapping configured — skip duplicate detection
+    // No mapping configured — skip duplicate detection.
+    // Surfacing this in logs so the operator notices when the feature is
+    // expected to be active but the configuration row has gone missing.
+    console.warn(
+      '[duplicate-detect] account_settings.duplicate_tag_mapping is empty — feature disabled'
+    );
     return;
   }
 
   // Ensure duplicate tags exist
-  await ensureTags(db);
+  await ensureTags(db, tagNames);
 
   // Get last run timestamp from account_settings
   const lastRunRow = await db.prepare(

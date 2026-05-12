@@ -38,7 +38,15 @@ export default function TestRecipientsSetting({ accountId }: TestRecipientsSetti
     const timer = setTimeout(async () => {
       setSearching(true)
       try {
-        const res = await api.friends.list({ search, accountId, limit: 5 })
+        // The worker now ranks friends by match quality (exact > prefix >
+        // word-start > generic substring) before created_at DESC. So
+        // `limit: 10` here gives 10 best matches across the entire account,
+        // not "10 newest containing the substring". Fixes the long-standing
+        // issue where the operator's own friend record (day-one) was buried
+        // by recently-added friends sharing the same substring.
+        // includeTags=false: tags not rendered here; skipping the per-row
+        // tag fetch turns ~11 D1 reads/keystroke into 2 (count + list).
+        const res = await api.friends.list({ search, accountId, limit: 10, includeTags: false })
         if (res.success) {
           const existing = new Set(recipients.map(r => r.id))
           const items = (res.data as unknown as { items: Friend[] }).items ?? res.data

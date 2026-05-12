@@ -40,6 +40,21 @@ export async function processBroadcastSend(
     finalType = tracked.messageType;
     finalContent = tracked.content;
   }
+  // {{liff_id}} 置換: broadcast の line_account_id に紐付く LIFF ID で替える。
+  // multi-account-dedup は dedup-broadcast.ts 側で per-account 置換するので
+  // ここは scheduled / tag / segment / all 系の単一 account 経路のみ。
+  // multi-account-dedup の sentinel account を踏むと placeholder が消えて
+  // dedup ループ側で {{liff_id}} を見失うので、ここでは置換しない。
+  if (broadcast.target_type !== 'multi-account-dedup') {
+    const broadcastAccountId = (broadcast as unknown as Record<string, unknown>).line_account_id as string | null;
+    if (broadcastAccountId) {
+      const { getLineAccountById: getLA } = await import('@line-crm/db');
+      const acct = await getLA(db, broadcastAccountId);
+      const liffId = (acct as unknown as { liff_id?: string | null } | null)?.liff_id ?? null;
+      const { renderMessageContent } = await import('./render-message.js');
+      finalContent = renderMessageContent(finalContent, liffId);
+    }
+  }
   const altText = (broadcast as unknown as Record<string, unknown>).alt_text as string | undefined;
   const message = buildMessage(finalType, finalContent, altText || undefined);
   let totalCount = 0;
@@ -88,11 +103,14 @@ export async function processBroadcastSend(
           successCount += batch.length;
 
           // Log only successfully sent messages (batch insert for performance)
+          // line_account_id は broadcast 設定時のアカウントを記録 (送信時点の固定値)。
+          // friends.line_account_id は webhook で書き換わる mutable なので使わない。
+          const broadcastAccount = (broadcast as unknown as Record<string, unknown>).line_account_id as string | null;
           const logStmts = batch.map(friend =>
             db.prepare(
-              `INSERT INTO messages_log (id, friend_id, direction, message_type, content, broadcast_id, scenario_step_id, source, created_at)
-               VALUES (?, ?, 'outgoing', ?, ?, ?, NULL, 'broadcast', ?)`,
-            ).bind(crypto.randomUUID(), friend.id, broadcast.message_type, broadcast.message_content, broadcastId, now),
+              `INSERT INTO messages_log (id, friend_id, direction, message_type, content, broadcast_id, scenario_step_id, source, line_account_id, created_at)
+               VALUES (?, ?, 'outgoing', ?, ?, ?, NULL, 'broadcast', ?, ?)`,
+            ).bind(crypto.randomUUID(), friend.id, broadcast.message_type, broadcast.message_content, broadcastId, broadcastAccount, now),
           );
           await db.batch(logStmts);
         } catch (err) {
@@ -101,6 +119,17 @@ export async function processBroadcastSend(
         }
       }
       await updateBroadcastLineRequestId(db, broadcast.id, null, unit);
+    } else if (broadcast.target_type === 'multi-account-dedup') {
+      // Always queued via routes/broadcasts.ts、ただし scheduled 経由でも
+      // processBroadcastSend に到達するため両方カバーが必要。dedup 内部で
+      // per-account に {{liff_id}} 置換 + buildMessage するが、auto-track
+      // 結果 (finalType / finalContent) を反映した broadcast を渡さないと
+      // tracked Flex 変換が落ちる。
+      const { processMultiAccountDedupBroadcast } = await import('./dedup-broadcast.js');
+      const broadcastForDedup = { ...broadcast, message_type: finalType, message_content: finalContent };
+      const result = await processMultiAccountDedupBroadcast(db, broadcastForDedup);
+      totalCount = result.totalCount;
+      successCount = result.successCount;
     }
 
     await createBroadcastInsight(db, broadcast.id);
@@ -204,8 +233,15 @@ async function processQueuedBroadcastBatches(
 
   // 排他ロック: batch_offset を -1 に設定して他のCronが拾わないようにする
   // WHERE batch_offset = ? で楽観ロック（既に他が処理中なら更新0行→スキップ）
+  // batch_lock_at は recoverStalledBroadcasts が「ロック取得後 N 分経過」を判定する
+  // ためのタイムスタンプ。created_at だと draft 作成時刻基準で本物の lock age と
+  // ずれて Worker 並走 race を引き起こすため別カラムで管理する。
+  // 重要: 値は SQL の strftime で生成する。jstNow() の '+09:00' suffix は SQLite で
+  // UTC 正規化されて見かけ 9 時間古くなり、recover 側 (julianday('now','+9 hours'))
+  // と比較すると即座に「stale」扱いされて lock 取得直後に解除される。created_at
+  // 列の DEFAULT と同じ式を使って naive JST に揃える。
   const lockResult = await db.prepare(
-    `UPDATE broadcasts SET batch_offset = -1 WHERE id = ? AND batch_offset = ?`,
+    `UPDATE broadcasts SET batch_offset = -1, batch_lock_at = strftime('%Y-%m-%dT%H:%M:%f', 'now', '+9 hours') WHERE id = ? AND batch_offset = ?`,
   ).bind(broadcast.id, batchOffset).run();
   if (!lockResult.meta.changes || lockResult.meta.changes === 0) {
     // 他のCron実行が既に処理中 → スキップ
@@ -227,8 +263,34 @@ async function processQueuedBroadcastBatches(
     }
   }
 
+  // {{liff_id}} 置換 (single account 経路のみ; multi は dedup 側で per-account 置換)。
+  const queuedAccountId = raw.line_account_id as string | null;
+  if (queuedAccountId && broadcast.target_type !== 'multi-account-dedup') {
+    const { getLineAccountById: getLA } = await import('@line-crm/db');
+    const acct = await getLA(db, queuedAccountId);
+    const liffId = (acct as unknown as { liff_id?: string | null } | null)?.liff_id ?? null;
+    const { renderMessageContent } = await import('./render-message.js');
+    finalContent = renderMessageContent(finalContent, liffId);
+  }
   const altText = raw.alt_text as string | undefined;
   const message = buildMessage(finalType, finalContent, altText || undefined);
+
+  // multi-account-dedup: delegate to processMultiAccountDedupBroadcast.
+  // dedup ループは内部で per-account に {{liff_id}} 置換 + buildMessage する。
+  // auto-track で計算された finalType / finalContent を反映した broadcast を
+  // 渡す (broadcast 引数の message_content をそのまま使うと auto-track 結果が
+  // 落ちる)。
+  if (broadcast.target_type === 'multi-account-dedup') {
+    const { processMultiAccountDedupBroadcast } = await import('./dedup-broadcast.js');
+    const broadcastForDedup = { ...broadcast, message_type: finalType, message_content: finalContent };
+    const result = await processMultiAccountDedupBroadcast(db, broadcastForDedup);
+    await createBroadcastInsight(db, broadcast.id);
+    await updateBroadcastStatus(db, broadcast.id, 'sent', {
+      totalCount: result.totalCount,
+      successCount: result.successCount,
+    });
+    return;
+  }
 
   // 対象ユーザーリストを取得（アカウントで絞り込む）
   const accountId = raw.line_account_id as string | null;
@@ -298,12 +360,15 @@ async function processQueuedBroadcastBatches(
     }
 
     // 送信成功後のログ・進捗更新（失敗しても再送しない）
+    // line_account_id は queue path lock 時の broadcast.line_account_id を使う
+    // (friends.line_account_id ではなく送信元アカウントを固定で記録)。
+    const queuedBroadcastAccount = (broadcast as unknown as Record<string, unknown>).line_account_id as string | null;
     try {
       const stmts = batch.map(friend =>
         db.prepare(
-          `INSERT INTO messages_log (id, friend_id, direction, message_type, content, broadcast_id, scenario_step_id, source, created_at)
-           VALUES (?, ?, 'outgoing', ?, ?, ?, NULL, 'broadcast', ?)`,
-        ).bind(crypto.randomUUID(), friend.id, broadcast.message_type, broadcast.message_content, broadcast.id, now),
+          `INSERT INTO messages_log (id, friend_id, direction, message_type, content, broadcast_id, scenario_step_id, source, line_account_id, created_at)
+           VALUES (?, ?, 'outgoing', ?, ?, ?, NULL, 'broadcast', ?, ?)`,
+        ).bind(crypto.randomUUID(), friend.id, broadcast.message_type, broadcast.message_content, broadcast.id, queuedBroadcastAccount, now),
       );
       await db.batch(stmts);
     } catch (logErr) {

@@ -2,15 +2,24 @@
 
 import { useState, useEffect } from 'react'
 
+interface PerAccountBreakdown {
+  accountId: string
+  accountName: string
+  sendCount: number
+}
+
 interface SendConfirmDialogProps {
   title: string
   targetCount: number
   accountName: string
+  /** true で multi-account 配信としてレンダリングする (perAccount=[] でも単アカ表示にしない). */
+  isMultiAccount?: boolean
+  perAccount?: PerAccountBreakdown[]
   onConfirm: () => void
   onCancel: () => void
 }
 
-export default function SendConfirmDialog({ title, targetCount, accountName, onConfirm, onCancel }: SendConfirmDialogProps) {
+export default function SendConfirmDialog({ title, targetCount, accountName, isMultiAccount, perAccount, onConfirm, onCancel }: SendConfirmDialogProps) {
   const [countdown, setCountdown] = useState(3)
 
   useEffect(() => {
@@ -18,6 +27,8 @@ export default function SendConfirmDialog({ title, targetCount, accountName, onC
     const timer = setTimeout(() => setCountdown(c => c - 1), 1000)
     return () => clearTimeout(timer)
   }, [countdown])
+
+  const showBreakdown = isMultiAccount === true
 
   return (
     <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
@@ -32,10 +43,32 @@ export default function SendConfirmDialog({ title, targetCount, accountName, onC
             <dt className="text-gray-500">対象</dt>
             <dd className="text-gray-900 font-medium">{targetCount.toLocaleString('ja-JP')}人</dd>
           </div>
-          <div className="flex justify-between">
-            <dt className="text-gray-500">アカウント</dt>
-            <dd className="text-gray-900 font-medium">{accountName}</dd>
-          </div>
+          {showBreakdown ? (
+            <div>
+              <dt className="text-gray-500 mb-1">配信先</dt>
+              <dd className="space-y-1 mt-1 border-t border-gray-100 pt-2">
+                {perAccount === undefined ? (
+                  // データ未取得 (preview-count 読み込み中 or 失敗)。"全アカウント無効" と
+                  // 誤表示しないように loading 表示にする。
+                  <p className="text-xs text-gray-400">読み込み中...</p>
+                ) : perAccount.length > 0 ? (
+                  perAccount.map((p) => (
+                    <div key={p.accountId} className="flex justify-between text-xs">
+                      <span className="text-gray-700">{p.accountName}</span>
+                      <span className="text-gray-900 font-medium">{p.sendCount.toLocaleString('ja-JP')}通</span>
+                    </div>
+                  ))
+                ) : (
+                  <p className="text-xs text-amber-600">送信可能なアカウントがありません（全アカウント無効）</p>
+                )}
+              </dd>
+            </div>
+          ) : (
+            <div className="flex justify-between">
+              <dt className="text-gray-500">アカウント</dt>
+              <dd className="text-gray-900 font-medium">{accountName}</dd>
+            </div>
+          )}
         </dl>
         <p className="text-xs text-amber-600 mb-4">送信後は取り消せません</p>
         <div className="flex gap-2">

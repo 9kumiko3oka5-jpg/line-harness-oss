@@ -7,6 +7,10 @@ import {
   claimFriendScenarioForDelivery,
   getFriendById,
   jstNow,
+  computeNextDeliveryAt,
+  resolveStepContent,
+  addTagToFriend,
+  type DeliveryMode,
 } from '@line-crm/db';
 import type { LineClient } from '@line-crm/line-sdk';
 import type { Message } from '@line-crm/line-sdk';
@@ -88,27 +92,6 @@ export async function resolveMetadata(
   return {};
 }
 
-/** Default delivery window: 9:00-23:00 JST. If outside, push to next 9:00 AM. */
-const DEFAULT_START_HOUR = 9;
-const DEFAULT_END_HOUR = 23;
-
-function enforceDeliveryWindow(date: Date, preferredHour?: number): Date {
-  // date is already shifted to JST epoch (+9h)
-  const hours = date.getUTCHours();
-  const startHour = preferredHour ?? DEFAULT_START_HOUR;
-  const endHour = DEFAULT_END_HOUR;
-
-  if (hours >= startHour && hours < endHour) return date;
-
-  // Outside window: push to next preferred start hour
-  const result = new Date(date);
-  if (hours >= endHour) {
-    result.setUTCDate(result.getUTCDate() + 1);
-  }
-  result.setUTCHours(startHour, 0, 0, 0);
-  return result;
-}
-
 const MAX_SENDS_PER_CRON = 40; // CF Free plan: 50 subrequests limit (margin for other jobs)
 
 export async function processStepDeliveries(
@@ -116,10 +99,6 @@ export async function processStepDeliveries(
   lineClient: LineClient,
   workerUrl?: string,
 ): Promise<void> {
-  // Skip delivery outside 9:00-23:00 JST window
-  const jstHour = new Date(Date.now() + 9 * 60 * 60_000).getUTCHours();
-  if (jstHour < DEFAULT_START_HOUR || jstHour >= DEFAULT_END_HOUR) return;
-
   const now = jstNow();
   const dueFriendScenarios = await getFriendScenariosDueForDelivery(db, now);
 
@@ -151,6 +130,7 @@ async function processSingleDelivery(
     current_step_order: number;
     status: string;
     next_delivery_at: string | null;
+    started_at: string;
   },
   workerUrl?: string,
 ): Promise<boolean> {
@@ -158,14 +138,21 @@ async function processSingleDelivery(
   const claimed = await claimFriendScenarioForDelivery(db, fs.id, fs.current_step_order);
   if (!claimed) return false;
 
-  // Get friend first to read preferred delivery hour from metadata
   const friend = await getFriendById(db, fs.friend_id);
   if (!friend || !friend.is_following) {
     await completeFriendScenario(db, fs.id);
     return false;
   }
-  const metadata = JSON.parse((friend as { metadata?: string }).metadata || '{}') as Record<string, unknown>;
-  const preferredHour = typeof metadata.preferred_hour === 'number' ? metadata.preferred_hour : undefined;
+
+  // Fetch scenario row for delivery_mode (needed by computeNextDeliveryAt below)
+  const scenarioRow = await db
+    .prepare(`SELECT delivery_mode FROM scenarios WHERE id = ?`)
+    .bind(fs.scenario_id)
+    .first<{ delivery_mode: DeliveryMode }>();
+  if (!scenarioRow) {
+    await completeFriendScenario(db, fs.id);
+    return false;
+  }
 
   // Get all steps for this scenario
   const steps = await getScenarioSteps(db, fs.scenario_id);
@@ -173,6 +160,19 @@ async function processSingleDelivery(
     await completeFriendScenario(db, fs.id);
     return false;
   }
+
+  // computeNextDeliveryAt は「JST clock-time を UTC として表現する Date」前提
+  // (setHours/getDate が JST clock 通りに動くようにオフセット済みの Date)。
+  // fs.started_at は "+09:00" 付き ISO で本物の UTC instant として parse されるため、
+  // +9h ずらして JST clock-time 表現に揃える必要がある。
+  const enrolledAtDate = new Date(new Date(fs.started_at).getTime() + 9 * 60 * 60_000);
+  const nowJstDate = new Date(Date.now() + 9 * 60 * 60_000);
+  const nextDeliveryFor = (step: { delay_minutes: number; offset_days: number | null; offset_minutes: number | null; delivery_time: string | null }): Date =>
+    computeNextDeliveryAt(
+      { delivery_mode: scenarioRow.delivery_mode },
+      step,
+      { enrolledAt: enrolledAtDate, previousDeliveredAt: nowJstDate, now: nowJstDate },
+    );
 
   // Steps are sorted by step_order but may not be contiguous (e.g., 1, 3, 5 after deletions).
   // Find the next step whose step_order > current_step_order.
@@ -190,10 +190,7 @@ async function processSingleDelivery(
       if (currentStep.next_step_on_false !== null && currentStep.next_step_on_false !== undefined) {
         const jumpStep = steps.find((s) => s.step_order === currentStep.next_step_on_false);
         if (jumpStep) {
-          const nextDate = new Date(Date.now() + 9 * 60 * 60_000);
-          nextDate.setMinutes(nextDate.getMinutes() + jumpStep.delay_minutes);
-          const windowedDate = enforceDeliveryWindow(nextDate, preferredHour);
-          const jitteredDate = jitterDeliveryTime(windowedDate);
+          const jitteredDate = jitterDeliveryTime(nextDeliveryFor(jumpStep));
           await advanceFriendScenario(db, fs.id, currentStep.step_order, jitteredDate.toISOString().slice(0, -1) + '+09:00');
           return false;
         }
@@ -201,10 +198,7 @@ async function processSingleDelivery(
       const nextIndex = steps.indexOf(currentStep) + 1;
       if (nextIndex < steps.length) {
         const nextStep = steps[nextIndex];
-        const nextDate = new Date(Date.now() + 9 * 60 * 60_000);
-        nextDate.setMinutes(nextDate.getMinutes() + nextStep.delay_minutes);
-        const windowedDate = enforceDeliveryWindow(nextDate, preferredHour);
-        const jitteredDate = jitterDeliveryTime(windowedDate);
+        const jitteredDate = jitterDeliveryTime(nextDeliveryFor(nextStep));
         await advanceFriendScenario(db, fs.id, currentStep.step_order, jitteredDate.toISOString().slice(0, -1) + '+09:00');
       } else {
         await completeFriendScenario(db, fs.id);
@@ -213,16 +207,19 @@ async function processSingleDelivery(
     }
   }
 
+  // Resolve template_id → templates table (参照型). template_id 未設定なら step 値そのまま。
+  const resolved = await resolveStepContent(db, currentStep);
+
   // Expand template variables ({{name}}, {{uid}}, {{auth_url:CHANNEL_ID}}, {{metadata.KEY}}, etc.)
   const resolvedMeta = await resolveMetadata(db, { user_id: (friend as unknown as Record<string, string | null>).user_id, metadata: (friend as unknown as Record<string, string | null>).metadata });
   const friendWithMeta = { ...friend, metadata: resolvedMeta } as Parameters<typeof expandVariables>[1];
-  const expandedContent = expandVariables(currentStep.message_content, friendWithMeta, workerUrl);
+  const expandedContent = expandVariables(resolved.messageContent, friendWithMeta, workerUrl);
   // Auto-wrap URLs with tracking links (text with URLs → Flex with button)
-  let trackedType: string = currentStep.message_type;
+  let trackedType: string = resolved.messageType;
   let trackedContent = expandedContent;
   if (workerUrl) {
     const { autoTrackContent } = await import('./auto-track.js');
-    const tracked = await autoTrackContent(db, currentStep.message_type, expandedContent, workerUrl);
+    const tracked = await autoTrackContent(db, resolved.messageType, expandedContent, workerUrl);
     trackedType = tracked.messageType;
     trackedContent = tracked.content;
   }
@@ -247,10 +244,10 @@ async function processSingleDelivery(
   const logPayload = messageToLogPayload(message);
   await db
     .prepare(
-      `INSERT INTO messages_log (id, friend_id, direction, message_type, content, broadcast_id, scenario_step_id, source, created_at)
-       VALUES (?, ?, 'outgoing', ?, ?, NULL, ?, 'scenario', ?)`,
+      `INSERT INTO messages_log (id, friend_id, direction, message_type, content, broadcast_id, scenario_step_id, source, template_id_at_send, created_at)
+       VALUES (?, ?, 'outgoing', ?, ?, NULL, ?, 'scenario', ?, ?)`,
     )
-    .bind(logId, friend.id, logPayload.messageType, logPayload.content, currentStep.id, jstNow())
+    .bind(logId, friend.id, logPayload.messageType, logPayload.content, currentStep.id, resolved.templateIdAtSend, jstNow())
     .run();
 
   // Determine next step (find the step after currentStep in the sorted list)
@@ -258,15 +255,21 @@ async function processSingleDelivery(
   const nextStep = currentIndex + 1 < steps.length ? steps[currentIndex + 1] : null;
 
   if (nextStep) {
-    // Schedule next delivery with stealth jitter + delivery window enforcement
-    const nextDeliveryDate = new Date(Date.now() + 9 * 60 * 60_000);
-    nextDeliveryDate.setMinutes(nextDeliveryDate.getMinutes() + nextStep.delay_minutes);
-    const windowedDate = enforceDeliveryWindow(nextDeliveryDate, preferredHour);
-    const jitteredDate = jitterDeliveryTime(windowedDate);
+    const jitteredDate = jitterDeliveryTime(nextDeliveryFor(nextStep));
     await advanceFriendScenario(db, fs.id, currentStep.step_order, jitteredDate.toISOString().slice(0, -1) + '+09:00');
   } else {
     // This was the last step
     await completeFriendScenario(db, fs.id);
+  }
+
+  // 到達タグ付与 (advance / complete の後 = 再送が起きてもタグ付与は影響しない順序)
+  // 失敗してもログに残すだけで配信フローは止めない。
+  if (currentStep.on_reach_tag_id) {
+    try {
+      await addTagToFriend(db, friend.id, currentStep.on_reach_tag_id);
+    } catch (err) {
+      console.error(`[scenario] tag attach failed step=${currentStep.id}:`, err);
+    }
   }
   return true;
 }

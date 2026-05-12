@@ -1,13 +1,27 @@
 import { Hono } from 'hono';
 import { cors } from 'hono/cors';
 import { LineClient } from '@line-crm/line-sdk';
-import { getLineAccounts, getTrafficPoolBySlug, getRandomPoolAccount, getPoolAccounts } from '@line-crm/db';
+import {
+  getLineAccounts,
+  getTrafficPoolBySlug,
+  getTrafficPoolById,
+  getRandomPoolAccount,
+  getPoolAccounts,
+  getEntryRouteByRefCode,
+} from '@line-crm/db';
 import { processStepDeliveries } from './services/step-delivery.js';
 import { processScheduledBroadcasts, processQueuedBroadcasts } from './services/broadcast.js';
 import { processReminderDeliveries } from './services/reminder-delivery.js';
 import { checkAccountHealth } from './services/ban-monitor.js';
 import { refreshLineAccessTokens } from './services/token-refresh.js';
 import { processInsightFetch } from './services/insight-fetcher.js';
+import { processDueReminders } from './services/booking-reminders.js';
+import { runExpirer } from './services/booking-expirer.js';
+import { processDueEventReminders } from './services/event-booking-reminders.js';
+import { runEventBookingExpirer } from './services/event-booking-expirer.js';
+import { sendEventBookingNotification } from './services/event-booking-notifier.js';
+import { sendBookingNotification } from './services/booking-notifier.js';
+import { DEFAULT_ACCOUNT_SETTINGS } from './services/booking-types.js';
 import { authMiddleware } from './middleware/auth.js';
 import { rateLimitMiddleware } from './middleware/rate-limit.js';
 import { webhook } from './routes/webhook.js';
@@ -19,6 +33,9 @@ import { users } from './routes/users.js';
 import { lineAccounts } from './routes/line-accounts.js';
 import { conversions } from './routes/conversions.js';
 import { affiliates } from './routes/affiliates.js';
+import { duplicates } from './routes/duplicates.js';
+import { usersGrouped } from './routes/users-grouped.js';
+import { inbox } from './routes/inbox.js';
 import { openapi } from './routes/openapi.js';
 import { liffRoutes } from './routes/liff.js';
 // Round 3 ルート
@@ -29,12 +46,15 @@ import { scoring } from './routes/scoring.js';
 import { templates } from './routes/templates.js';
 import { chats } from './routes/chats.js';
 import { conversations } from './routes/conversations.js';
-import { notifications } from './routes/notifications.js';
+// notifications ルート (notification_rules CRUD + notifications 一覧) は
+// インボックス機能 (/api/inbox/unanswered) に置き換えたため削除。
+// DB テーブル notification_rules / notifications は archive 目的で残してある。
 import { stripe } from './routes/stripe.js';
 import { health } from './routes/health.js';
 import { automations } from './routes/automations.js';
 import { richMenus } from './routes/rich-menus.js';
 import { trackedLinks } from './routes/tracked-links.js';
+import { entryRoutes } from './routes/entry-routes.js';
 import { forms } from './routes/forms.js';
 import { adPlatforms } from './routes/ad-platforms.js';
 import { staff } from './routes/staff.js';
@@ -43,9 +63,14 @@ import { images } from './routes/images.js';
 import { accountSettings } from './routes/account-settings.js';
 import { setup } from './routes/setup.js';
 import { autoReplies } from './routes/auto-replies.js';
+import booking from './routes/booking.js';
+import events from './routes/events.js';
 import { trafficPools } from './routes/traffic-pools.js';
 import { meetCallback } from './routes/meet-callback.js';
 import { messageTemplates } from './routes/message-templates.js';
+import dedupPreview from './routes/dedup-preview.js';
+import { profileRefresh } from './routes/profile-refresh.js';
+import { richMenuGroups } from './routes/rich-menu-groups.js';
 
 export type Env = {
   Bindings: {
@@ -91,6 +116,9 @@ app.route('/', users);
 app.route('/', lineAccounts);
 app.route('/', conversions);
 app.route('/', affiliates);
+app.route('/', duplicates);
+app.route('/', usersGrouped);
+app.route('/', inbox);
 app.route('/', openapi);
 app.route('/', liffRoutes);
 
@@ -102,12 +130,12 @@ app.route('/', scoring);
 app.route('/', templates);
 app.route('/', chats);
 app.route('/', conversations);
-app.route('/', notifications);
 app.route('/', stripe);
 app.route('/', health);
 app.route('/', automations);
 app.route('/', richMenus);
 app.route('/', trackedLinks);
+app.route('/', entryRoutes);
 app.route('/', forms);
 app.route('/', adPlatforms);
 app.route('/', staff);
@@ -116,9 +144,14 @@ app.route('/', images);
 app.route('/', setup);
 app.route('/', autoReplies);
 app.route('/', trafficPools);
+app.route('/', booking);
+app.route('/', events);
 app.route('/', accountSettings);
 app.route('/', meetCallback);
 app.route('/', messageTemplates);
+app.route('/', dedupPreview);
+app.route('/', profileRefresh);
+app.route('/', richMenuGroups);
 
 // Self-hosted QR code proxy — prevents leaking ref tokens to third-party services
 app.get('/api/qr', async (c) => {
@@ -145,10 +178,35 @@ app.get('/r/:ref', async (c) => {
   const ref = c.req.param('ref');
   const formId = c.req.query('form') || '';
 
-  // Resolve LIFF URL from pool (same logic as /auth/line)
+  // Resolve LIFF URL — priority:
+  //   1. entry_route.pool_id (if ref maps to a referral link)
+  //   2. URL query ?pool=
+  //   3. 'main' fallback
   let liffUrl = c.env.LIFF_URL;
-  const poolSlug = c.req.query('pool') || 'main';
-  const pool = await getTrafficPoolBySlug(c.env.DB, poolSlug);
+  let pool: Awaited<ReturnType<typeof getTrafficPoolBySlug>> | null = null;
+
+  // 1. entry_route lookup. getTrafficPoolById (unlike getTrafficPoolBySlug)
+  // does not filter on is_active, so we ignore disabled pools explicitly to
+  // honor the operator's pause action.
+  //
+  // NOTE: we intentionally do NOT record a ref_tracking row here. The
+  // /auth/callback + /api/liff/link path already writes a tracking row when
+  // OAuth/LIFF completes, and writing a second landing-page row would
+  // double-count every successful click in getEntryRouteFunnel. Landing-page
+  // drop-off (clicks that never reach OAuth) is therefore not visible in the
+  // funnel; that limitation is intentional pending a dedicated click table.
+  const route = await getEntryRouteByRefCode(c.env.DB, ref);
+  if (route?.pool_id) {
+    const candidate = await getTrafficPoolById(c.env.DB, route.pool_id);
+    if (candidate?.is_active) pool = candidate;
+  }
+
+  // 2 / 3. fallback to URL query or 'main'
+  if (!pool) {
+    const poolSlug = c.req.query('pool') || 'main';
+    pool = await getTrafficPoolBySlug(c.env.DB, poolSlug);
+  }
+
   if (pool) {
     const account = await getRandomPoolAccount(c.env.DB, pool.id);
     if (account) {
@@ -449,7 +507,7 @@ app.notFound(async (c) => {
 
 // Scheduled handler for cron triggers — runs for all active LINE accounts
 async function scheduled(
-  _event: ScheduledEvent,
+  event: ScheduledEvent,
   env: Env['Bindings'],
   _ctx: ExecutionContext,
 ): Promise<void> {
@@ -492,13 +550,68 @@ async function scheduled(
     console.error('Insight fetch error:', e);
   }
 
-  // Cross-account duplicate detection & auto-tagging
+  // Booking reminders — every 5-minute tick scans due reminders.
   try {
-    const { processDuplicateDetection } = await import('./services/duplicate-detect.js');
-    await processDuplicateDetection(env.DB);
+    const result = await processDueReminders(env.DB, {
+      now: new Date(),
+      sender: sendBookingNotification,
+      reminderHoursBefore: DEFAULT_ACCOUNT_SETTINGS.reminder_hours_before,
+    });
+    if (result.sent + result.failed > 0) {
+      console.log(`[booking-reminders] sent=${result.sent} failed=${result.failed}`);
+    }
   } catch (e) {
-    console.error('Duplicate detection error:', e);
+    console.error('booking-reminders error:', e);
   }
+
+  // Booking expirer — runs only on the 6h cron tick.
+  if (event.cron === '0 */6 * * *') {
+    try {
+      const result = await runExpirer(env.DB, {
+        now: new Date(),
+        sender: sendBookingNotification,
+      });
+      console.log(
+        `[booking-expirer] expired=${result.expired} idempotency_purged=${result.idempotencyPurged}`,
+      );
+    } catch (e) {
+      console.error('booking-expirer error:', e);
+    }
+  }
+
+  // Event-booking reminders — every 5-minute tick scans due reminders.
+  try {
+    const result = await processDueEventReminders(env.DB, {
+      now: new Date(),
+      sender: sendEventBookingNotification,
+    });
+    if (result.sent + result.failed > 0) {
+      console.log(`[event-booking-reminders] sent=${result.sent} failed=${result.failed}`);
+    }
+  } catch (e) {
+    console.error('event-booking-reminders error:', e);
+  }
+
+  // Event-booking expirer — 6h cron tick.
+  if (event.cron === '0 */6 * * *') {
+    try {
+      const result = await runEventBookingExpirer(env.DB, { now: new Date() });
+      console.log(
+        `[event-booking-expirer] expired=${result.expired} idempotency_purged=${result.idempotencyPurged}`,
+      );
+    } catch (e) {
+      console.error('event-booking-expirer error:', e);
+    }
+  }
+
+  // Cross-account duplicate detection — disabled.
+  // The cron used to materialize duplicates into the tag system but the 1k-subrequest
+  // budget can't drain a 1k+ candidate backlog, and a live SELECT against
+  // friends.picture_url / display_name / status_message gives the same answer
+  // on demand. Replacement: a /api/duplicates endpoint plus a dashboard view
+  // (planned alongside the multi-provider UI work). Keeping the service file
+  // (apps/worker/src/services/duplicate-detect.ts) and the existing
+  // `重複:` tag rows untouched until that replacement lands.
 }
 
 export default {

@@ -1,7 +1,9 @@
 import { jstNow } from './utils.js';
+import { computeNextDeliveryAt } from './scenario-schedule.js';
 export type ScenarioTriggerType = 'friend_add' | 'tag_added' | 'manual';
 export type MessageType = 'text' | 'image' | 'flex';
 export type FriendScenarioStatus = 'active' | 'paused' | 'completed';
+export type DeliveryMode = 'relative' | 'elapsed' | 'absolute_time';
 
 export interface Scenario {
   id: string;
@@ -11,6 +13,7 @@ export interface Scenario {
   trigger_tag_id: string | null;
   line_account_id: string | null;
   is_active: number;
+  delivery_mode: DeliveryMode;
   created_at: string;
   updated_at: string;
 }
@@ -25,6 +28,11 @@ export interface ScenarioStep {
   condition_type: string | null;
   condition_value: string | null;
   next_step_on_false: number | null;
+  offset_days: number | null;
+  offset_minutes: number | null;
+  delivery_time: string | null;
+  template_id: string | null;
+  on_reach_tag_id: string | null;
   created_at: string;
 }
 
@@ -88,6 +96,7 @@ export interface CreateScenarioInput {
   description?: string | null;
   triggerType: ScenarioTriggerType;
   triggerTagId?: string | null;
+  deliveryMode?: DeliveryMode;
 }
 
 export async function createScenario(
@@ -99,8 +108,8 @@ export async function createScenario(
 
   await db
     .prepare(
-      `INSERT INTO scenarios (id, name, description, trigger_type, trigger_tag_id, is_active, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, 1, ?, ?)`,
+      `INSERT INTO scenarios (id, name, description, trigger_type, trigger_tag_id, is_active, delivery_mode, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?)`,
     )
     .bind(
       id,
@@ -108,6 +117,7 @@ export async function createScenario(
       input.description ?? null,
       input.triggerType,
       input.triggerTagId ?? null,
+      input.deliveryMode ?? 'relative',
       now,
       now,
     )
@@ -192,6 +202,11 @@ export interface CreateScenarioStepInput {
   conditionType?: string | null;
   conditionValue?: string | null;
   nextStepOnFalse?: number | null;
+  offsetDays?: number | null;
+  offsetMinutes?: number | null;
+  deliveryTime?: string | null;
+  templateId?: string | null;
+  onReachTagId?: string | null;
 }
 
 export async function createScenarioStep(
@@ -203,8 +218,13 @@ export async function createScenarioStep(
 
   await db
     .prepare(
-      `INSERT INTO scenario_steps (id, scenario_id, step_order, delay_minutes, message_type, message_content, condition_type, condition_value, next_step_on_false, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO scenario_steps
+       (id, scenario_id, step_order, delay_minutes, message_type, message_content,
+        condition_type, condition_value, next_step_on_false,
+        offset_days, offset_minutes, delivery_time,
+        template_id, on_reach_tag_id,
+        created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     )
     .bind(
       id,
@@ -216,6 +236,11 @@ export async function createScenarioStep(
       input.conditionType ?? null,
       input.conditionValue ?? null,
       input.nextStepOnFalse ?? null,
+      input.offsetDays ?? null,
+      input.offsetMinutes ?? null,
+      input.deliveryTime ?? null,
+      input.templateId ?? null,
+      input.onReachTagId ?? null,
       now,
     )
     .run();
@@ -227,7 +252,21 @@ export async function createScenarioStep(
 }
 
 export type UpdateScenarioStepInput = Partial<
-  Pick<ScenarioStep, 'step_order' | 'delay_minutes' | 'message_type' | 'message_content' | 'condition_type' | 'condition_value' | 'next_step_on_false'>
+  Pick<
+    ScenarioStep,
+    | 'step_order'
+    | 'delay_minutes'
+    | 'message_type'
+    | 'message_content'
+    | 'condition_type'
+    | 'condition_value'
+    | 'next_step_on_false'
+    | 'offset_days'
+    | 'offset_minutes'
+    | 'delivery_time'
+    | 'template_id'
+    | 'on_reach_tag_id'
+  >
 >;
 
 export async function updateScenarioStep(
@@ -265,6 +304,26 @@ export async function updateScenarioStep(
   if (updates.next_step_on_false !== undefined) {
     fields.push('next_step_on_false = ?');
     values.push(updates.next_step_on_false);
+  }
+  if (updates.offset_days !== undefined) {
+    fields.push('offset_days = ?');
+    values.push(updates.offset_days);
+  }
+  if (updates.offset_minutes !== undefined) {
+    fields.push('offset_minutes = ?');
+    values.push(updates.offset_minutes);
+  }
+  if (updates.delivery_time !== undefined) {
+    fields.push('delivery_time = ?');
+    values.push(updates.delivery_time);
+  }
+  if (updates.template_id !== undefined) {
+    fields.push('template_id = ?');
+    values.push(updates.template_id);
+  }
+  if (updates.on_reach_tag_id !== undefined) {
+    fields.push('on_reach_tag_id = ?');
+    values.push(updates.on_reach_tag_id);
   }
 
   if (fields.length > 0) {
@@ -310,13 +369,26 @@ export async function enrollFriendInScenario(
   const id = crypto.randomUUID();
   const now = jstNow();
 
-  // Get the first step to calculate next_delivery_at
+  // delivery_mode を取得（migration 037 適用前の DB では 'relative' が DEFAULT で既に入っている）
+  const scenarioRow = await db
+    .prepare(`SELECT delivery_mode FROM scenarios WHERE id = ?`)
+    .bind(scenarioId)
+    .first<{ delivery_mode: DeliveryMode }>();
+  if (!scenarioRow) return null;
+
   const firstStep = await db
     .prepare(
-      `SELECT * FROM scenario_steps WHERE scenario_id = ? ORDER BY step_order ASC LIMIT 1`,
+      `SELECT step_order, delay_minutes, offset_days, offset_minutes, delivery_time
+       FROM scenario_steps WHERE scenario_id = ? ORDER BY step_order ASC LIMIT 1`,
     )
     .bind(scenarioId)
-    .first<{ step_order: number; delay_minutes: number }>();
+    .first<{
+      step_order: number;
+      delay_minutes: number;
+      offset_days: number | null;
+      offset_minutes: number | null;
+      delivery_time: string | null;
+    }>();
 
   // A scenario with no steps is immediately completed — no stuck active enrollment.
   if (!firstStep) {
@@ -336,14 +408,13 @@ export async function enrollFriendInScenario(
       .first<FriendScenario>())!;
   }
 
-  const rawDate = new Date(Date.now() + 9 * 60 * 60_000 + firstStep.delay_minutes * 60_000);
-  // Enforce 9:00-21:00 JST delivery window
-  const hours = rawDate.getUTCHours();
-  if (hours < 9 || hours >= 21) {
-    if (hours >= 21) rawDate.setUTCDate(rawDate.getUTCDate() + 1);
-    rawDate.setUTCHours(9, 0, 0, 0);
-  }
-  const nextDeliveryAt = rawDate.toISOString().slice(0, -1) + '+09:00';
+  const enrolledAtDate = new Date(Date.now() + 9 * 60 * 60_000);
+  const nextDeliveryDate = computeNextDeliveryAt(
+    { delivery_mode: scenarioRow.delivery_mode },
+    firstStep,
+    { enrolledAt: enrolledAtDate, previousDeliveredAt: enrolledAtDate, now: enrolledAtDate },
+  );
+  const nextDeliveryAt = nextDeliveryDate.toISOString().slice(0, -1) + '+09:00';
 
   // current_step_order is initialized to -1 (NOT 0) so that the step-delivery
   // service's `steps.find(s => s.step_order > fs.current_step_order)` lookup

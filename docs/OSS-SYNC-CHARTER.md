@@ -18,13 +18,14 @@
 
 ## 2. 同期フロー
 
-### 2.1 Private → OSS（自動）
+### 2.1 Private → OSS（手動運用）
 
 ```
-Private push → GitHub Actions (sync-oss.yml) → OSS に自動反映
+Private push → bash scripts/sync-oss.sh を手動実行 → OSS に反映
 ```
 
-- main ブランチへの push で自動実行
+- `.github/workflows/sync-oss.yml` は意図的に失敗運用 (即時公開でうっかり OSS に出る事故防止)
+- OSS に反映したいタイミングで `bash scripts/sync-oss.sh` を手動実行
 - `rsync --delete` で同期（除外ファイルあり）
 - シークレット自動置換（sed）
 - リーク検知で失敗時は同期中止

@@ -62,6 +62,8 @@ export default function BroadcastsPage() {
   return <BroadcastList />
 }
 
+type BroadcastTab = 'single' | 'dedup' | 'all'
+
 function BroadcastList() {
   const { selectedAccountId } = useAccount()
   const [broadcasts, setBroadcasts] = useState<ApiBroadcast[]>([])
@@ -71,6 +73,7 @@ function BroadcastList() {
   const [showCreate, setShowCreate] = useState(false)
   const [insights, setInsights] = useState<Record<string, BroadcastInsight>>({})
   const [fetchingInsight, setFetchingInsight] = useState<string | null>(null)
+  const [activeTab, setActiveTab] = useState<BroadcastTab>('all')
 
   const loadInsight = async (id: string) => {
     try {
@@ -135,6 +138,16 @@ function BroadcastList() {
     return tags.find((t) => t.id === tagId)?.name ?? null
   }
 
+  // タブで分類: 単アカ配信 (multi-account-dedup 以外) と 複アカ重複除外配信 を分ける。
+  // 全件タブは未フィルタ。サイドバー account context のフィルタは API 側で済んでる。
+  const dedupCount = broadcasts.filter((b) => b.targetType === 'multi-account-dedup').length
+  const singleCount = broadcasts.length - dedupCount
+  const visibleBroadcasts = broadcasts.filter((b) => {
+    if (activeTab === 'all') return true
+    if (activeTab === 'dedup') return b.targetType === 'multi-account-dedup'
+    return b.targetType !== 'multi-account-dedup'
+  })
+
   return (
     <div>
       <Header
@@ -166,6 +179,33 @@ function BroadcastList() {
         />
       )}
 
+      {/* Tabs */}
+      {!loading && broadcasts.length > 0 && (
+        <div className="mb-4 flex gap-1 border-b border-gray-200">
+          {([
+            { id: 'all', label: '全部', count: broadcasts.length },
+            { id: 'single', label: '単アカ配信', count: singleCount },
+            { id: 'dedup', label: '複アカ重複除外', count: dedupCount },
+          ] as const).map((tab) => (
+            <button
+              key={tab.id}
+              onClick={() => setActiveTab(tab.id)}
+              className={`px-4 py-2 text-sm font-medium border-b-2 transition-colors ${
+                activeTab === tab.id
+                  ? 'border-green-500 text-gray-900'
+                  : 'border-transparent text-gray-500 hover:text-gray-700'
+              }`}
+              style={activeTab === tab.id ? { borderColor: '#06C755' } : undefined}
+            >
+              {tab.label}
+              <span className="ml-1.5 inline-flex items-center justify-center px-1.5 py-0 rounded-full bg-gray-100 text-xs text-gray-600 min-w-[20px]">
+                {tab.count}
+              </span>
+            </button>
+          ))}
+        </div>
+      )}
+
       {/* Loading */}
       {loading ? (
         <div className="bg-white rounded-lg shadow-sm border border-gray-200 overflow-hidden">
@@ -183,6 +223,12 @@ function BroadcastList() {
       ) : broadcasts.length === 0 && !showCreate ? (
         <div className="bg-white rounded-lg shadow-sm border border-gray-200 p-12 text-center">
           <p className="text-gray-500">配信がありません。「新規配信」から作成してください。</p>
+        </div>
+      ) : visibleBroadcasts.length === 0 ? (
+        <div className="bg-white rounded-lg shadow-sm border border-gray-200 p-12 text-center">
+          <p className="text-gray-500">
+            {activeTab === 'dedup' ? '複数アカ重複除外配信はまだありません。' : 'このタブに該当する配信はありません。'}
+          </p>
         </div>
       ) : (
         <div className="bg-white rounded-lg shadow-sm border border-gray-200 overflow-hidden">
@@ -212,18 +258,26 @@ function BroadcastList() {
               </tr>
             </thead>
             <tbody className="divide-y divide-gray-100">
-              {broadcasts.map((broadcast) => {
+              {visibleBroadcasts.map((broadcast) => {
                 const statusInfo = statusConfig[broadcast.status]
                 const tagName = getTagName(broadcast.targetTagId)
+                const isDedup = broadcast.targetType === 'multi-account-dedup'
 
                 return (
                   <tr key={broadcast.id} className="hover:bg-gray-50 transition-colors">
                     {/* Title */}
                     <td className="px-4 py-3">
                       <div>
-                        <a href={`/broadcasts?id=${broadcast.id}`} className="text-sm font-medium text-blue-600 hover:text-blue-800 hover:underline">
-                          {broadcast.title}
-                        </a>
+                        <div className="flex items-center gap-2">
+                          <a href={`/broadcasts?id=${broadcast.id}`} className="text-sm font-medium text-blue-600 hover:text-blue-800 hover:underline">
+                            {broadcast.title}
+                          </a>
+                          {isDedup && (
+                            <span className="inline-flex items-center px-1.5 py-0 rounded text-[10px] font-medium bg-purple-100 text-purple-700">
+                              複アカ
+                            </span>
+                          )}
+                        </div>
                         <p className="text-xs text-gray-400 mt-0.5">
                           {broadcast.messageType === 'text' ? 'テキスト' : broadcast.messageType === 'image' ? '画像' : 'Flex'}
                         </p>
@@ -239,7 +293,9 @@ function BroadcastList() {
 
                     {/* Target */}
                     <td className="px-4 py-3 text-sm text-gray-600">
-                      {broadcast.targetType === 'all' ? (
+                      {isDedup ? (
+                        <span className="text-purple-700">重複除外{tagName ? `: ${tagName}` : ''}</span>
+                      ) : broadcast.targetType === 'all' ? (
                         '全員'
                       ) : tagName ? (
                         <span>タグ: {tagName}</span>

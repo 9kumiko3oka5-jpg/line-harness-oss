@@ -13,17 +13,101 @@ import {
   upsertChatOnMessage,
   getLineAccounts,
   jstNow,
+  computeNextDeliveryAt,
+  resolveStepContent,
+  addTagToFriend,
+  getEntryRouteByRefCode,
+  getMessageTemplateById,
 } from '@line-crm/db';
+import type { EntryRoute } from '@line-crm/db';
 import { fireEvent } from '../services/event-bus.js';
 import { buildMessage, expandVariables } from '../services/step-delivery.js';
 import type { Env } from '../index.js';
 
 const webhook = new Hono<Env>();
 
+// LINE webhook bodies are small (events array). Cap defends against unauthenticated
+// large-payload DoS before signature verification (#104). 1 MiB leaves room for
+// bursty batched deliveries (~100 events × ~5 KB) while still well below the
+// 128 MB Cloudflare Workers memory ceiling.
+const MAX_WEBHOOK_BODY_SIZE = 1024 * 1024; // 1 MiB
+
 webhook.post('/webhook', async (c) => {
+  // Pre-read size guard: reject before reading the body if Content-Length is oversized.
+  const contentLengthHeader = c.req.header('Content-Length');
+  if (contentLengthHeader) {
+    const declared = Number.parseInt(contentLengthHeader, 10);
+    if (Number.isFinite(declared) && declared > MAX_WEBHOOK_BODY_SIZE) {
+      return c.json({ status: 'too_large' }, 413);
+    }
+  }
+
   const rawBody = await c.req.text();
+
+  // Post-read size guard for the case where Content-Length was absent or untrustworthy.
+  // Use UTF-8 byte count: `rawBody.length` counts UTF-16 code units, so multibyte
+  // payloads (Japanese/emoji) would otherwise bypass the cap.
+  const rawBodyByteLength = new TextEncoder().encode(rawBody).byteLength;
+  if (rawBodyByteLength > MAX_WEBHOOK_BODY_SIZE) {
+    return c.json({ status: 'too_large' }, 413);
+  }
+
   const signature = c.req.header('X-Line-Signature') ?? '';
   const db = c.env.DB;
+
+  // Cheap pre-reject for unsigned / malformed-signature requests. LINE signatures
+  // are HMAC-SHA256 + base64 = 44 chars. This avoids D1 lookups and HMAC compute
+  // for junk traffic on a public endpoint.
+  const LINE_SIGNATURE_LENGTH = 44;
+  if (signature.length !== LINE_SIGNATURE_LENGTH) {
+    console.error('Missing or malformed LINE signature');
+    return c.json({ status: 'ok' }, 200);
+  }
+
+  // Verify signature BEFORE JSON.parse so attacker-controlled bodies never reach the parser.
+  // Fast path: try env default secret first so malformed/unauthenticated traffic
+  //   fails fast without a D1 lookup. The main account is typically also registered
+  //   in line_accounts; on env match we still look it up so matchedAccountId binds
+  //   correctly for downstream account-scoped filters.
+  // Slow path: iterate DB-registered accounts for genuinely multi-account installs.
+  let channelAccessToken = c.env.LINE_CHANNEL_ACCESS_TOKEN;
+  let matchedAccountId: string | null = null;
+  let valid = false;
+
+  const envSecret = c.env.LINE_CHANNEL_SECRET;
+  if (envSecret) {
+    valid = await verifySignature(envSecret, rawBody, signature);
+    if (valid) {
+      const accounts = await getLineAccounts(db);
+      const main = accounts.find(
+        (a) => a.is_active && a.channel_secret === envSecret,
+      );
+      if (main) {
+        channelAccessToken = main.channel_access_token;
+        matchedAccountId = main.id;
+      }
+    }
+  }
+
+  if (!valid) {
+    const accounts = await getLineAccounts(db);
+    for (const account of accounts) {
+      if (!account.is_active) continue;
+      if (envSecret && account.channel_secret === envSecret) continue; // already tried via fast path
+      const isValid = await verifySignature(account.channel_secret, rawBody, signature);
+      if (isValid) {
+        channelAccessToken = account.channel_access_token;
+        matchedAccountId = account.id;
+        valid = true;
+        break;
+      }
+    }
+  }
+
+  if (!valid) {
+    console.error('Invalid LINE signature');
+    return c.json({ status: 'ok' }, 200);
+  }
 
   let body: WebhookRequestBody;
   try {
@@ -33,40 +117,13 @@ webhook.post('/webhook', async (c) => {
     return c.json({ status: 'ok' }, 200);
   }
 
-  // Multi-account: resolve credentials from DB by destination (channel user ID)
-  // or fall back to environment variables (default account)
-  let channelSecret = c.env.LINE_CHANNEL_SECRET;
-  let channelAccessToken = c.env.LINE_CHANNEL_ACCESS_TOKEN;
-  let matchedAccountId: string | null = null;
-
-  if ((body as { destination?: string }).destination) {
-    const accounts = await getLineAccounts(db);
-    for (const account of accounts) {
-      if (!account.is_active) continue;
-      const isValid = await verifySignature(account.channel_secret, rawBody, signature);
-      if (isValid) {
-        channelSecret = account.channel_secret;
-        channelAccessToken = account.channel_access_token;
-        matchedAccountId = account.id;
-        break;
-      }
-    }
-  }
-
-  // Verify with resolved secret
-  const valid = await verifySignature(channelSecret, rawBody, signature);
-  if (!valid) {
-    console.error('Invalid LINE signature');
-    return c.json({ status: 'ok' }, 200);
-  }
-
   const lineClient = new LineClient(channelAccessToken);
 
   // 非同期処理 — LINE は ~1s 以内のレスポンスを要求
   const processingPromise = (async () => {
     for (const event of body.events) {
       try {
-        await handleEvent(db, lineClient, event, channelAccessToken, matchedAccountId, c.env.WORKER_URL || new URL(c.req.url).origin);
+        await handleEvent(db, lineClient, event, channelAccessToken, matchedAccountId, c.env.WORKER_URL || new URL(c.req.url).origin, c.env.LIFF_URL);
       } catch (err) {
         console.error('Error handling webhook event:', err);
       }
@@ -85,6 +142,7 @@ async function handleEvent(
   lineAccessToken: string,
   lineAccountId: string | null = null,
   workerUrl?: string,
+  liffUrl?: string,
 ): Promise<void> {
   if (event.type === 'follow') {
     const userId =
@@ -119,8 +177,34 @@ async function handleEvent(
       console.log(`[follow] line_account_id set to ${lineAccountId} for friend ${friend.id}`);
     }
 
+    // Resolve referral link (entry_route) for this friend.
+    // /auth/callback (OAuth path) writes friends.ref_code in parallel with
+    // this follow webhook, so the field can briefly be NULL when LINE
+    // delivers the event. Retry a few times (~1s total) before giving up,
+    // otherwise override mode and intro pushes silently fall back to the
+    // account default whenever the webhook wins the race.
+    const { getFriendById } = await import('@line-crm/db');
+    let friendRefCode = (friend as { ref_code?: string | null }).ref_code ?? null;
+    if (!friendRefCode) {
+      for (let attempt = 0; attempt < 5; attempt++) {
+        await new Promise((resolve) => setTimeout(resolve, 200));
+        const refreshed = await getFriendById(db, friend.id);
+        const refreshedRef = (refreshed as { ref_code?: string | null } | null)?.ref_code ?? null;
+        if (refreshedRef) {
+          friendRefCode = refreshedRef;
+          break;
+        }
+      }
+    }
+    const referralRoute: EntryRoute | null = friendRefCode
+      ? await getEntryRouteByRefCode(db, friendRefCode)
+      : null;
+    const runAccountScenarios =
+      !referralRoute || referralRoute.run_account_friend_add_scenarios !== 0;
+
     // friend_add シナリオに登録（このアカウントのシナリオのみ）
-    const scenarios = await getScenarios(db);
+    // Skip entirely when a referral link explicitly overrides (run_account_friend_add_scenarios=0).
+    const scenarios = runAccountScenarios ? await getScenarios(db) : [];
     for (const scenario of scenarios) {
       // Only trigger scenarios belonging to this account (or unassigned for backward compat)
       const scenarioAccountMatch = !scenario.line_account_id || !lineAccountId || scenario.line_account_id === lineAccountId;
@@ -130,15 +214,35 @@ async function handleEvent(
           const friendScenario = await enrollFriendInScenario(db, friend.id, scenario.id);
           if (!friendScenario) continue; // already enrolled
 
-            // Immediate delivery: if the first step has delay=0, send it now via replyMessage (free)
+            // Immediate delivery: scenario.delivery_mode を踏まえて step1 が「now 以前」に
+            // スケジュールされる場合のみ replyMessage で即時送信する。
+            // - relative + delay_minutes=0 → 即時
+            // - elapsed + offset_days=0 + offset_minutes=0 → 即時
+            // - absolute_time で過去時刻 → computeNextDeliveryAt が now に clamp するので即時
             const steps = await getScenarioSteps(db, scenario.id);
             const firstStep = steps[0];
-            if (firstStep && firstStep.delay_minutes === 0 && friendScenario.status === 'active') {
+            const deliveryMode = scenario.delivery_mode ?? 'relative';
+            const enrolledAtJst = new Date(Date.now() + 9 * 60 * 60_000);
+            const firstScheduledAt = firstStep
+              ? computeNextDeliveryAt(
+                  { delivery_mode: deliveryMode },
+                  firstStep,
+                  { enrolledAt: enrolledAtJst, previousDeliveredAt: enrolledAtJst, now: enrolledAtJst },
+                )
+              : null;
+            const shouldSendImmediately =
+              firstStep &&
+              firstScheduledAt !== null &&
+              firstScheduledAt.getTime() <= enrolledAtJst.getTime() &&
+              friendScenario.status === 'active';
+            if (firstStep && shouldSendImmediately) {
               try {
+                // Resolve template_id → templates table (参照型)
+                const resolved = await resolveStepContent(db, firstStep);
                 const { resolveMetadata } = await import('../services/step-delivery.js');
                 const resolvedMeta = await resolveMetadata(db, { user_id: (friend as unknown as Record<string, string | null>).user_id, metadata: (friend as unknown as Record<string, string | null>).metadata });
-                const expandedContent = expandVariables(firstStep.message_content, { ...friend, metadata: resolvedMeta } as Parameters<typeof expandVariables>[1]);
-                const message = buildMessage(firstStep.message_type, expandedContent);
+                const expandedContent = expandVariables(resolved.messageContent, { ...friend, metadata: resolvedMeta } as Parameters<typeof expandVariables>[1]);
+                const message = buildMessage(resolved.messageType, expandedContent);
                 await lineClient.replyMessage(event.replyToken, [message]);
                 console.log(`Immediate delivery: sent step ${firstStep.id} to ${userId}`);
 
@@ -149,26 +253,33 @@ async function handleEvent(
                 const wbScenarioPayload = logPayload1(message);
                 await db
                   .prepare(
-                    `INSERT INTO messages_log (id, friend_id, direction, message_type, content, broadcast_id, scenario_step_id, delivery_type, source, created_at)
-                     VALUES (?, ?, 'outgoing', ?, ?, NULL, ?, 'reply', 'scenario', ?)`,
+                    `INSERT INTO messages_log (id, friend_id, direction, message_type, content, broadcast_id, scenario_step_id, delivery_type, source, template_id_at_send, created_at)
+                     VALUES (?, ?, 'outgoing', ?, ?, NULL, ?, 'reply', 'scenario', ?, ?)`,
                   )
-                  .bind(logId, friend.id, wbScenarioPayload.messageType, wbScenarioPayload.content, firstStep.id, jstNow())
+                  .bind(logId, friend.id, wbScenarioPayload.messageType, wbScenarioPayload.content, firstStep.id, resolved.templateIdAtSend, jstNow())
                   .run();
 
-                // Advance or complete the friend_scenario
+                // Advance or complete the friend_scenario — step 2 のスケジュールも
+                // computeNextDeliveryAt で計算する（elapsed/absolute_time で正しく動かすため）
                 const secondStep = steps[1] ?? null;
                 if (secondStep) {
-                  const nextDeliveryDate = new Date(Date.now() + 9 * 60 * 60_000);
-                  nextDeliveryDate.setMinutes(nextDeliveryDate.getMinutes() + secondStep.delay_minutes);
-                  // Enforce 9:00-21:00 JST delivery window
-                  const h = nextDeliveryDate.getUTCHours();
-                  if (h < 9 || h >= 21) {
-                    if (h >= 21) nextDeliveryDate.setUTCDate(nextDeliveryDate.getUTCDate() + 1);
-                    nextDeliveryDate.setUTCHours(9, 0, 0, 0);
-                  }
+                  const nextDeliveryDate = computeNextDeliveryAt(
+                    { delivery_mode: deliveryMode },
+                    secondStep,
+                    { enrolledAt: enrolledAtJst, previousDeliveredAt: enrolledAtJst, now: enrolledAtJst },
+                  );
                   await advanceFriendScenario(db, friendScenario.id, firstStep.step_order, nextDeliveryDate.toISOString().slice(0, -1) + '+09:00');
                 } else {
                   await completeFriendScenario(db, friendScenario.id);
+                }
+
+                // 到達タグ付与 (advance / complete の後)
+                if (firstStep.on_reach_tag_id) {
+                  try {
+                    await addTagToFriend(db, friend.id, firstStep.on_reach_tag_id);
+                  } catch (err) {
+                    console.error(`[scenario] tag attach failed step=${firstStep.id}:`, err);
+                  }
                 }
               } catch (err) {
                 console.error('Failed immediate delivery for scenario', scenario.id, err);
@@ -176,6 +287,33 @@ async function handleEvent(
             }
         } catch (err) {
           console.error('Failed to enroll friend in scenario', scenario.id, err);
+        }
+      }
+    }
+
+    // Referral link side-effects (intro push + dedicated scenario)
+    if (referralRoute) {
+      // Intro push from referral link
+      if (referralRoute.intro_template_id) {
+        try {
+          const template = await getMessageTemplateById(db, referralRoute.intro_template_id);
+          if (template) {
+            const message = buildMessage(template.message_type, template.message_content);
+            await lineClient.pushMessage(userId, [message]);
+            console.log(`[follow] referral intro push sent route=${referralRoute.id}`);
+          }
+        } catch (err) {
+          console.error('[follow] referral intro push failed', err);
+        }
+      }
+
+      // Dedicated scenario enrollment from referral link
+      if (referralRoute.scenario_id) {
+        try {
+          await enrollFriendInScenario(db, friend.id, referralRoute.scenario_id);
+          console.log(`[follow] referral scenario enrolled scenario=${referralRoute.scenario_id}`);
+        } catch (err) {
+          console.error('[follow] referral scenario enrollment failed', err);
         }
       }
     }
@@ -217,7 +355,24 @@ async function handleEvent(
         match_type: 'exact' | 'contains';
         response_type: string;
         response_content: string;
+        template_id: string | null;
       }>();
+
+    // postback の incoming 自体を messages_log に記録する。Rich Menu のタップで
+     // 利用者が "コスト比較" などのアクションを起こした事実を chat 履歴で可視化する。
+     // delivery_type='push' は厳密には push ではないが、incoming/non-test として
+     // 既存 chat list / 詳細 SQL のフィルタを通すための妥当な値 (auto_reply text 同様)。
+    try {
+      await db
+        .prepare(
+          `INSERT INTO messages_log (id, friend_id, direction, message_type, content, broadcast_id, scenario_step_id, source, line_account_id, created_at)
+           VALUES (?, ?, 'incoming', 'text', ?, NULL, NULL, 'postback', ?, ?)`,
+        )
+        .bind(crypto.randomUUID(), friend.id, postbackData, lineAccountId ?? null, jstNow())
+        .run();
+    } catch (err) {
+      console.error('Failed to log incoming postback', err);
+    }
 
     for (const rule of autoReplies.results) {
       const isMatch = rule.match_type === 'exact'
@@ -228,9 +383,26 @@ async function handleEvent(
         try {
           const { resolveMetadata } = await import('../services/step-delivery.js');
           const resolvedMeta = await resolveMetadata(db, { user_id: (friend as unknown as Record<string, string | null>).user_id, metadata: (friend as unknown as Record<string, string | null>).metadata });
-          const expandedContent = expandVariables(rule.response_content, { ...friend, metadata: resolvedMeta } as Parameters<typeof expandVariables>[1], workerUrl);
-          const replyMsg = buildMessage(rule.response_type, expandedContent);
+          const resolved = await resolveAutoReplyContent(db, {
+            template_id: rule.template_id,
+            response_type: rule.response_type,
+            response_content: rule.response_content,
+          });
+          const expandedContent = expandVariables(resolved.content, { ...friend, metadata: resolvedMeta } as Parameters<typeof expandVariables>[1], workerUrl);
+          const replyMsg = buildMessage(resolved.messageType, expandedContent);
           await lineClient.replyMessage(event.replyToken, [replyMsg]);
+
+          // 送信ログ — Rich Menu 経由の Flex 応答もチャット詳細に残るようにする。
+          // テキスト auto_reply (line ~390) と同じパターン。
+          const { messageToLogPayload: logPayload } = await import('../services/step-delivery.js');
+          const replyPayload = logPayload(replyMsg);
+          await db
+            .prepare(
+              `INSERT INTO messages_log (id, friend_id, direction, message_type, content, broadcast_id, scenario_step_id, delivery_type, source, line_account_id, created_at)
+               VALUES (?, ?, 'outgoing', ?, ?, NULL, NULL, 'reply', 'auto_reply', ?, ?)`,
+            )
+            .bind(crypto.randomUUID(), friend.id, replyPayload.messageType, replyPayload.content, lineAccountId ?? null, jstNow())
+            .run();
         } catch (err) {
           console.error('Failed to send postback reply', err);
         }
@@ -292,46 +464,6 @@ async function handleEvent(
       .bind(logId, friend.id, incomingText, now)
       .run();
 
-    // チャット unread 判定は auto_replies マッチ結果 (matched) を使う。
-    // ハードコードキーワードリストは廃止 — auto_replies テーブルが single source of truth。
-    const isTimeCommand = /(?:配信時間|配信|届けて|通知)[はを]?\s*\d{1,2}\s*時/.test(incomingText);
-
-    // 配信時間設定: 「配信時間は○時」「○時に届けて」等のパターンを検出
-    const timeMatch = incomingText.match(/(?:配信時間|配信|届けて|通知)[はを]?\s*(\d{1,2})\s*時/);
-    if (timeMatch) {
-      const hour = parseInt(timeMatch[1], 10);
-      if (hour >= 6 && hour <= 22) {
-        // Save preferred_hour to friend metadata
-        const existing = await db.prepare('SELECT metadata FROM friends WHERE id = ?').bind(friend.id).first<{ metadata: string }>();
-        const meta = JSON.parse(existing?.metadata || '{}');
-        meta.preferred_hour = hour;
-        await db.prepare('UPDATE friends SET metadata = ?, updated_at = ? WHERE id = ?')
-          .bind(JSON.stringify(meta), jstNow(), friend.id).run();
-
-        // Reply with confirmation
-        try {
-          const period = hour < 12 ? '午前' : '午後';
-          const displayHour = hour <= 12 ? hour : hour - 12;
-          await lineClient.replyMessage(event.replyToken, [
-            buildMessage('flex', JSON.stringify({
-              type: 'bubble',
-              body: { type: 'box', layout: 'vertical', contents: [
-                { type: 'text', text: '配信時間を設定しました', size: 'lg', weight: 'bold', color: '#1e293b' },
-                { type: 'box', layout: 'vertical', contents: [
-                  { type: 'text', text: `${period} ${displayHour}:00`, size: 'xxl', weight: 'bold', color: '#f59e0b', align: 'center' },
-                  { type: 'text', text: `（${hour}:00〜）`, size: 'sm', color: '#64748b', align: 'center', margin: 'sm' },
-                ], backgroundColor: '#fffbeb', cornerRadius: 'md', paddingAll: '20px', margin: 'lg' },
-                { type: 'text', text: '今後のステップ配信はこの時間以降にお届けします。', size: 'xs', color: '#64748b', wrap: true, margin: 'lg' },
-              ], paddingAll: '20px' },
-            })),
-          ]);
-        } catch (err) {
-          console.error('Failed to reply for time setting', err);
-        }
-        return;
-      }
-    }
-
     // Cross-account trigger: send message from another account via UUID
     if (incomingText === '体験を完了する' && lineAccountId) {
       try {
@@ -361,7 +493,7 @@ async function handleEvent(
               footer: { type: 'box', layout: 'vertical', paddingAll: '16px',
                 contents: [
                   { type: 'button', action: { type: 'message', label: '導入について相談する', text: '導入支援を希望します' }, style: 'primary', color: '#06C755' },
-                  ...(c.env.LIFF_URL ? [{ type: 'button', action: { type: 'uri', label: 'フィードバックを送る', uri: `${c.env.LIFF_URL}?page=form` }, style: 'secondary', margin: 'sm' }] : []),
+                  ...(liffUrl ? [{ type: 'button', action: { type: 'uri', label: 'フィードバックを送る', uri: `${liffUrl}?page=form` }, style: 'secondary', margin: 'sm' }] : []),
                 ],
               },
             }))]);
@@ -398,6 +530,7 @@ async function handleEvent(
         match_type: 'exact' | 'contains';
         response_type: string;
         response_content: string;
+        template_id: string | null;
         is_active: number;
         created_at: string;
       }>();
@@ -420,8 +553,13 @@ async function handleEvent(
         try {
           const { resolveMetadata: resolveMeta2 } = await import('../services/step-delivery.js');
           const resolvedMeta2 = await resolveMeta2(db, { user_id: (friend as unknown as Record<string, string | null>).user_id, metadata: (friend as unknown as Record<string, string | null>).metadata });
-          const expandedContent = expandVariables(rule.response_content, { ...friend, metadata: resolvedMeta2 } as Parameters<typeof expandVariables>[1], workerUrl);
-          const replyMsg = buildMessage(rule.response_type, expandedContent);
+          const resolved = await resolveAutoReplyContent(db, {
+            template_id: rule.template_id,
+            response_type: rule.response_type,
+            response_content: rule.response_content,
+          });
+          const expandedContent = expandVariables(resolved.content, { ...friend, metadata: resolvedMeta2 } as Parameters<typeof expandVariables>[1], workerUrl);
+          const replyMsg = buildMessage(resolved.messageType, expandedContent);
           await lineClient.replyMessage(event.replyToken, [replyMsg]);
           replyTokenConsumed = true;
 
@@ -447,8 +585,8 @@ async function handleEvent(
       }
     }
 
-    // auto_replies にマッチしなかった & 配信時間コマンドでもない = 自発メッセージ → unread にする
-    if (!matched && !isTimeCommand) {
+    // auto_replies にマッチしなかった = 自発メッセージ → unread にする
+    if (!matched) {
       await upsertChatOnMessage(db, friend.id);
     }
 
@@ -462,6 +600,24 @@ async function handleEvent(
 
     return;
   }
+}
+
+/**
+ * auto_reply 行の content/type を resolve する。template_id が set なら templates
+ * から取得、参照切れや NULL のときは inline response_content/response_type を使う。
+ */
+async function resolveAutoReplyContent(
+  db: D1Database,
+  rule: { template_id: string | null; response_type: string; response_content: string },
+): Promise<{ messageType: string; content: string }> {
+  if (rule.template_id) {
+    const { getTemplateById } = await import('@line-crm/db');
+    const tpl = await getTemplateById(db, rule.template_id);
+    if (tpl) {
+      return { messageType: tpl.message_type, content: tpl.message_content };
+    }
+  }
+  return { messageType: rule.response_type, content: rule.response_content };
 }
 
 export { webhook };

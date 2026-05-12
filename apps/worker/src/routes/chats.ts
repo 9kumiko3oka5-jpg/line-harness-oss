@@ -189,20 +189,79 @@ chats.get('/api/chats', async (c) => {
     // List everyone who has any message history (incoming or outgoing — push/broadcast/scenario included)
     // PLUS any chats row that exists even before any messages_log entry is written.
     // Source = messages_log ∪ chats.friend_id; chats は status/operator/notes 用に LEFT JOIN で最新1件だけ採用。
+    //
+    // recent_msg CTE で friend_id ごとに最新の messages_log 行をひとつ取得し、本文 preview と
+    // direction (incoming/outgoing) を一覧に出す。
+    //
+    // パフォーマンス対策:
+    //   1. lineAccountId 指定時は scoped_friends CTE で先に対象 friend を絞ってから messages_log
+    //      を ranking する (アカ別 inbox が他アカの履歴をスキャンしないように)。
+    //   2. content は text のみ先頭 200 文字まで切り詰めて返す (flex/image など raw JSON を返すと
+    //      broadcast 後の rows で multi-MB レスポンスになる)。
+    const accountFilterSql = lineAccountId
+      ? `friend_id IN (SELECT id FROM friends WHERE line_account_id = ?)`
+      : `1=1`;
     let sql = `
       WITH activity AS (
         SELECT friend_id, MAX(created_at) AS last_message_at
         FROM messages_log
-        WHERE delivery_type IS NULL OR delivery_type != 'test'
+        WHERE (delivery_type IS NULL OR delivery_type != 'test')
+          AND ${accountFilterSql}
         GROUP BY friend_id
         UNION ALL
         SELECT friend_id, last_message_at
         FROM chats
+        WHERE ${accountFilterSql}
       ),
       deduped AS (
         SELECT friend_id, MAX(last_message_at) AS last_message_at
         FROM activity
         GROUP BY friend_id
+      ),
+      -- preview は **最新の incoming (ユーザー発)** を優先する。auto_reply / scenario 等の
+      -- outbound が直後に書き込まれて preview を上書きすると「ユーザーが何と言ったか」が
+      -- 一覧から見えなくなる (operator triage の主目的が損なわれる)。
+      -- incoming が無い (broadcast push など outbound only) chat は最新 outbound にフォールバック。
+      -- text 以外 (flex/image/sticker 等) は content を NULL にして payload size を抑える
+      -- (フロントは type で 📋 Flex / 📷 画像 等のラベルを出すので content は不要)。
+      -- preview は **常に最新メッセージ** を表示する。postback (rich menu tap) も含む。
+      -- preview text と displayed time を揃えるための単純化 (deprioritize すると
+      -- 「最新は postback だが preview は古い text」の time mismatch が起きるため)。
+      -- 注: postback.data が opaque な JSON token だと一覧で人間には読めない値が出るが、
+      -- それは admin が rich menu の postback.data を人間向け文言にすべき config 問題。
+      -- (LINE 仕様: postback.displayText は admin が設定可能、それを data に揃えるのが推奨)
+      ranked_in AS (
+        SELECT friend_id,
+          CASE WHEN message_type = 'text' THEN SUBSTR(content, 1, 200) ELSE NULL END AS content,
+          direction, message_type, created_at,
+          ROW_NUMBER() OVER (PARTITION BY friend_id ORDER BY created_at DESC) AS rn
+        FROM messages_log
+        WHERE direction = 'incoming'
+          AND (delivery_type IS NULL OR delivery_type != 'test')
+          AND ${accountFilterSql}
+      ),
+      ranked_any AS (
+        SELECT friend_id,
+          CASE WHEN message_type = 'text' THEN SUBSTR(content, 1, 200) ELSE NULL END AS content,
+          direction, message_type, created_at,
+          ROW_NUMBER() OVER (PARTITION BY friend_id ORDER BY created_at DESC) AS rn
+        FROM messages_log
+        WHERE (delivery_type IS NULL OR delivery_type != 'test')
+          AND ${accountFilterSql}
+      ),
+      -- ra (any direction の最新) を master にして、ri (incoming の最新) を LEFT JOIN。
+      -- COALESCE で ri 優先 → incoming があればそれ、無ければ outbound にフォールバック。
+      -- created_at も preview の元メッセージに合わせて返す (一覧の時刻と preview text が
+      -- 別メッセージを指して mismatch する事故を防ぐ)。
+      recent_msg AS (
+        SELECT
+          ra.friend_id,
+          COALESCE(ri.content, ra.content) AS content,
+          COALESCE(ri.direction, ra.direction) AS direction,
+          COALESCE(ri.message_type, ra.message_type) AS message_type,
+          COALESCE(ri.created_at, ra.created_at) AS preview_at
+        FROM (SELECT * FROM ranked_any WHERE rn = 1) ra
+        LEFT JOIN (SELECT * FROM ranked_in WHERE rn = 1) ri ON ra.friend_id = ri.friend_id
       )
       SELECT
         f.id AS id,
@@ -214,7 +273,13 @@ chats.get('/api/chats', async (c) => {
         c.operator_id,
         COALESCE(c.status, 'resolved') AS status,
         c.notes,
-        d.last_message_at,
+        -- last_message_at は preview メッセージの時刻に揃える (一覧 row の時刻表示と preview が
+        -- 別メッセージを指す mismatch を防ぐ)。preview が無い (chats 行のみ存在) ケースは
+        -- d.last_message_at にフォールバック。
+        COALESCE(rm.preview_at, d.last_message_at) AS last_message_at,
+        rm.content AS last_message_content,
+        rm.direction AS last_message_direction,
+        rm.message_type AS last_message_type,
         COALESCE(c.created_at, d.last_message_at) AS created_at,
         COALESCE(c.updated_at, d.last_message_at) AS updated_at
       FROM deduped d
@@ -222,7 +287,12 @@ chats.get('/api/chats', async (c) => {
       LEFT JOIN chats c ON c.id = (
         SELECT id FROM chats WHERE friend_id = f.id ORDER BY created_at DESC LIMIT 1
       )
+      LEFT JOIN recent_msg rm ON rm.friend_id = f.id
     `;
+    // accountFilterSql に '?' が複数 (4 箇所) あるので、bindings は事前に積んでおく。
+    const ctePrebindings: unknown[] = lineAccountId
+      ? [lineAccountId, lineAccountId, lineAccountId, lineAccountId]
+      : [];
     const conditions: string[] = [];
     const bindings: unknown[] = [];
 
@@ -244,8 +314,10 @@ chats.get('/api/chats', async (c) => {
     }
     sql += ' ORDER BY d.last_message_at DESC';
 
-    const stmt = bindings.length > 0
-      ? c.env.DB.prepare(sql).bind(...bindings)
+    // CTE 内 placeholder (4 個) → 外側 WHERE placeholder の順に bind する
+    const allBindings = [...ctePrebindings, ...bindings];
+    const stmt = allBindings.length > 0
+      ? c.env.DB.prepare(sql).bind(...allBindings)
       : c.env.DB.prepare(sql);
     const result = await stmt.all();
 
@@ -260,6 +332,9 @@ chats.get('/api/chats', async (c) => {
         status: ch.status,
         notes: ch.notes,
         lastMessageAt: ch.last_message_at,
+        lastMessageContent: ch.last_message_content || null,
+        lastMessageDirection: ch.last_message_direction || null,
+        lastMessageType: ch.last_message_type || null,
         createdAt: ch.created_at,
         updatedAt: ch.updated_at,
       })),
