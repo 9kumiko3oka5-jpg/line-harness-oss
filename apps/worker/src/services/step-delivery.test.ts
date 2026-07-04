@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { evaluateCondition, isSupportedConditionType, SUPPORTED_CONDITION_TYPES, processStepDeliveries } from './step-delivery.js';
+import { evaluateCondition, isSupportedConditionType, SUPPORTED_CONDITION_TYPES, processStepDeliveries, expandVariables } from './step-delivery.js';
 import type { LineClient } from '@line-crm/line-sdk';
 
 /**
@@ -380,5 +380,57 @@ describe('condition-false jump (next_step_on_false)', () => {
 
     expect(advances).toHaveLength(1);
     expect(advances[0].nextStepOrder).toBe(2); // no step 99 → sequential path
+  });
+});
+
+/**
+ * Regression coverage for the comma-cleanup scope bug.
+ *
+ * The ",," / "[," / ",]" cleanup in expandVariables exists to repair Flex
+ * JSON broken by conditional-block removal ({{#if_ref}} / {{#if_metadata.KEY}}
+ * inside arrays). Pre-fix it ran on EVERY message type, silently rewriting
+ * plain-text bodies that legitimately contain those sequences.
+ */
+describe('expandVariables comma cleanup scope', () => {
+  const friend = { id: 'f1', display_name: 'Test', user_id: null };
+
+  describe('text messages are never rewritten', () => {
+    it('preserves ",," in a text body', () => {
+      const body = '価格は 1,, 2,, 3 のように表記します';
+      expect(expandVariables(body, friend, undefined, 'text')).toBe(body);
+    });
+
+    it('preserves "[," and ",]" in a text body', () => {
+      const body = '記法メモ: [, は開き、 ,] は閉じ';
+      expect(expandVariables(body, friend, undefined, 'text')).toBe(body);
+    });
+
+    it('preserves ",," when messageType is omitted (safe default)', () => {
+      const body = 'A,, B';
+      expect(expandVariables(body, friend)).toBe(body);
+    });
+
+    it('still expands {{name}} in text without touching commas', () => {
+      const out = expandVariables('{{name}}様, , こんにちは', friend, undefined, 'text');
+      expect(out).toBe('Test様, , こんにちは');
+    });
+  });
+
+  describe('flex messages keep the JSON repair (existing behaviour)', () => {
+    it('repairs "[," left by a removed {{#if_ref}} block so the JSON parses', () => {
+      // Simulates a Flex contents array whose first element was a conditional
+      // block removed for a friend without ref_code: [{{#if_ref}}{...}{{/if_ref}},{...}]
+      const template = '{"contents":[{{#if_ref}}{"type":"text","text":"ref: {{ref}}"}{{/if_ref}},{"type":"text","text":"hello"}]}';
+      const out = expandVariables(template, { ...friend, ref_code: null }, undefined, 'flex');
+      expect(out).toBe('{"contents":[{"type":"text","text":"hello"}]}');
+      expect(() => JSON.parse(out)).not.toThrow();
+    });
+
+    it('repairs ",]" when the removed block was the last array element', () => {
+      const template = '{"contents":[{"type":"text","text":"hello"},{{#if_metadata.plan}}{"type":"text","text":"{{metadata.plan}}"}{{/if_metadata.plan}}]}';
+      const out = expandVariables(template, { ...friend, metadata: {} }, undefined, 'flex');
+      expect(out).toBe('{"contents":[{"type":"text","text":"hello"}]}');
+      expect(() => JSON.parse(out)).not.toThrow();
+    });
   });
 });
