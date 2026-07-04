@@ -11,7 +11,7 @@
 
 [![点击在 YouTube 播放 — LINE Harness 配置教程](https://img.youtube.com/vi/DiRuGaeq1sM/maxresdefault.jpg)](https://youtu.be/DiRuGaeq1sM)
 
-**当前版本**: v0.13.2 ・ MIT 许可证 ・ TypeScript / Cloudflare Workers + D1
+**当前版本**: v0.15.0 ・ MIT 许可证 ・ TypeScript / Cloudflare Workers + D1
 
 ---
 
