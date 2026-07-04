@@ -213,6 +213,7 @@ async function applyRefAttribution(
         resolved.messageContent,
         { ...fresh, metadata: resolvedMeta } as Parameters<typeof expandVariables>[1],
         c.env.WORKER_URL,
+        resolved.messageType,
       );
       const pushedMessage = buildMessage(resolved.messageType, expanded);
       await lineClient.pushMessage(lineUserId, [pushedMessage]);
@@ -925,6 +926,7 @@ liffRoutes.get('/auth/callback', async (c) => {
                   resolved.messageContent,
                   { ...friend, metadata: resolvedMetaLiff } as Parameters<typeof expandVariables>[1],
                   c.env.WORKER_URL,
+                  resolved.messageType,
                 );
                 const pushedMessage = buildMessage(resolved.messageType, expandedContent);
                 await lineClient.pushMessage(lineUserId, [pushedMessage]);
