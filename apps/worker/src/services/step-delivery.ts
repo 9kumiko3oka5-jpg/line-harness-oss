@@ -191,7 +191,11 @@ async function processSingleDelivery(
         const jumpStep = steps.find((s) => s.step_order === currentStep.next_step_on_false);
         if (jumpStep) {
           const jitteredDate = jitterDeliveryTime(nextDeliveryFor(jumpStep));
-          await advanceFriendScenario(db, fs.id, currentStep.step_order, jitteredDate.toISOString().slice(0, -1) + '+09:00');
+          // Advance to just before the jump target so the next tick's
+          // `find(step_order > current_step_order)` selects jumpStep itself.
+          // Passing currentStep.step_order here (pre-fix) delivered the
+          // sequentially-next step and silently ignored next_step_on_false.
+          await advanceFriendScenario(db, fs.id, jumpStep.step_order - 1, jitteredDate.toISOString().slice(0, -1) + '+09:00');
           return false;
         }
       }
