@@ -410,6 +410,9 @@ chats.get('/api/chats/:id', async (c) => {
       .bind(resolvedFriendId)
       .all();
     messages.results = (messages.results as Record<string, unknown>[]).reverse();
+    // LIMIT 1000 above may have cut off older history (see comment above);
+    // surface that to the UI instead of silently dropping messages.
+    const truncated = (messages.results as Record<string, unknown>[]).length >= 1000;
 
     return c.json({
       success: true,
@@ -423,6 +426,7 @@ chats.get('/api/chats/:id', async (c) => {
         notes,
         lastMessageAt,
         createdAt,
+        truncated,
         messages: (messages.results as Record<string, unknown>[]).map((m) => ({
           id: m.id,
           direction: m.direction,

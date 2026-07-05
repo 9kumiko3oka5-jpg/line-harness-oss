@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { evaluateCondition, isSupportedConditionType, SUPPORTED_CONDITION_TYPES, processStepDeliveries, expandVariables } from './step-delivery.js';
+import { evaluateCondition, isSupportedConditionType, SUPPORTED_CONDITION_TYPES, processStepDeliveries, expandVariables, MAX_SENDS_PER_CRON } from './step-delivery.js';
 import type { LineClient } from '@line-crm/line-sdk';
 
 /**
@@ -432,5 +432,42 @@ describe('expandVariables comma cleanup scope', () => {
       expect(out).toBe('{"contents":[{"type":"text","text":"hello"}]}');
       expect(() => JSON.parse(out)).not.toThrow();
     });
+  });
+});
+
+/**
+ * Regression coverage for unguarded JSON.parse on friend.metadata.
+ *
+ * resolveMetadata() guards the identical parse with try/catch (falls back to
+ * {}), but expandVariables() did not, even though its type signature accepts
+ * a raw metadata string. Any future caller that skips resolveMetadata and
+ * passes a friend row straight from the DB would crash on malformed JSON.
+ */
+describe('expandVariables malformed metadata', () => {
+  it('does not throw when friend.metadata is an invalid JSON string', () => {
+    const friend = { id: 'f1', display_name: 'Test', user_id: null, metadata: '{not valid json' };
+    expect(() => expandVariables('{{name}} {{metadata.plan}}', friend, undefined, 'text')).not.toThrow();
+  });
+
+  it('treats invalid JSON metadata as empty (no {{metadata.KEY}} substitution)', () => {
+    const friend = { id: 'f1', display_name: 'Test', user_id: null, metadata: '{not valid json' };
+    const out = expandVariables('plan: {{metadata.plan}}', friend, undefined, 'text');
+    expect(out).toBe('plan: ');
+  });
+});
+
+/**
+ * Regression coverage for MAX_SENDS_PER_CRON vs Cloudflare Workers Free plan's
+ * subrequest limit (50/invocation). D1 queries count against this limit, not
+ * just fetch(). A single processSingleDelivery worst case issues up to 12
+ * subrequests (claim, getFriendById, scenario SELECT, getScenarioSteps,
+ * evaluateCondition, resolveStepContent, resolveMetadata, getLineAccountById,
+ * pushMessage, messages_log INSERT, advance/complete, addTagToFriend).
+ */
+describe('MAX_SENDS_PER_CRON stays within the CF Free plan subrequest budget', () => {
+  it('worst-case subrequests per cron run does not exceed 50', () => {
+    const CF_FREE_SUBREQUEST_LIMIT = 50;
+    const WORST_CASE_SUBREQUESTS_PER_DELIVERY = 12;
+    expect(MAX_SENDS_PER_CRON * WORST_CASE_SUBREQUESTS_PER_DELIVERY).toBeLessThanOrEqual(CF_FREE_SUBREQUEST_LIMIT);
   });
 });

@@ -44,9 +44,18 @@ export function expandVariables(
     result = result.replace(/\{\{#if_ref\}\}[\s\S]*?\{\{\/if_ref\}\}/g, '');
   }
   // Metadata variables: {{metadata.KEY}} → value from friend's metadata
-  const meta = friend.metadata
-    ? (typeof friend.metadata === 'string' ? JSON.parse(friend.metadata) as Record<string, unknown> : friend.metadata)
-    : {};
+  let meta: Record<string, unknown> = {};
+  if (friend.metadata) {
+    if (typeof friend.metadata === 'string') {
+      try {
+        meta = JSON.parse(friend.metadata) as Record<string, unknown>;
+      } catch {
+        meta = {};
+      }
+    } else {
+      meta = friend.metadata;
+    }
+  }
   // Conditional block: {{#if_metadata.KEY}}...{{/if_metadata.KEY}} — only shown if metadata key has a value
   // When inside JSON arrays, removes the element and fixes trailing/leading commas
   result = result.replace(/\{\{#if_metadata\.([^}]+)\}\}([\s\S]*?)\{\{\/if_metadata\.\1\}\}/g, (_match, key, inner) => {
@@ -97,7 +106,15 @@ export async function resolveMetadata(
   return {};
 }
 
-const MAX_SENDS_PER_CRON = 40; // CF Free plan: 50 subrequests limit (margin for other jobs)
+// CF Workers Free plan caps subrequests at 50 per invocation, and D1 queries
+// count against that limit (not just fetch()). A single processSingleDelivery
+// worst case issues up to 12 subrequests: claim(1) + getFriendById(1) +
+// scenario SELECT(1) + getScenarioSteps(1) + evaluateCondition(1) +
+// resolveStepContent(1) + resolveMetadata(1) + getLineAccountById(1) +
+// pushMessage fetch(1) + messages_log INSERT(1) + advance/complete(1) +
+// addTagToFriend(1). 40 sends (the old value) could burn 480+ subrequests
+// and abort mid-batch with "Too many subrequests" on Free plan.
+export const MAX_SENDS_PER_CRON = 4; // 4 * 12 = 48, within the 50 limit
 
 export async function processStepDeliveries(
   db: D1Database,

@@ -67,13 +67,19 @@ export default function ConversionsPage() {
       setForm({ name: '', eventType: '', value: '' })
       setShowCreate(false)
       load()
-    } catch {}
+    } catch (e) {
+      alert(e instanceof Error ? e.message : String(e))
+    }
   }
 
   const handleDelete = async (id: string) => {
     if (!confirm('このCVポイントを削除しますか？')) return
-    await api.conversions.deletePoint(id)
-    load()
+    try {
+      await api.conversions.deletePoint(id)
+      load()
+    } catch (e) {
+      alert(e instanceof Error ? e.message : String(e))
+    }
   }
 
   const eventTypes = [

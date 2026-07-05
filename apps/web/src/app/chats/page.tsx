@@ -38,6 +38,7 @@ interface ChatDetail extends Chat {
   friendName: string
   friendPictureUrl: string | null
   messages?: ChatMessage[]
+  truncated?: boolean
 }
 
 type StatusFilter = 'all' | 'unread' | 'in_progress' | 'resolved'
@@ -920,6 +921,12 @@ export default function ChatsPage() {
                   )}
                 </div>
               </div>
+
+              {chatDetail.truncated && (
+                <div className="px-4 py-1.5 text-xs text-center text-yellow-800 bg-yellow-100 border-b border-yellow-200">
+                  これより古いメッセージは表示されていません（直近1000件のみ表示）
+                </div>
+              )}
 
               {/* Messages — LINE-style chat bubbles */}
               <div ref={messagesScrollRef} className="flex-1 overflow-y-auto p-4 space-y-2" style={{ backgroundColor: '#7494C0' }}>
