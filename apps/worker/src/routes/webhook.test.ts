@@ -5,6 +5,7 @@ const lineClientMocks = vi.hoisted(() => ({
   getProfile: vi.fn(),
   replyMessage: vi.fn(),
   pushMessage: vi.fn(),
+  pushTextMessage: vi.fn(),
 }));
 
 // Stub the DB graph — these tests focus on webhook guard behavior and the
@@ -26,6 +27,7 @@ vi.mock('@line-crm/db', () => ({
   addTagToFriend: vi.fn(),
   getEntryRouteByRefCode: vi.fn(),
   getMessageTemplateById: vi.fn(),
+  getFriendById: vi.fn(),
 }));
 
 vi.mock('@line-crm/line-sdk', async () => {
@@ -295,5 +297,124 @@ describe('POST /webhook — first-contact existing friends', () => {
     expect(addTagToFriend).not.toHaveBeenCalled();
     expect(getEntryRouteByRefCode).not.toHaveBeenCalled();
     expect(getMessageTemplateById).not.toHaveBeenCalled();
+  });
+});
+
+describe('POST /webhook — owner notification', () => {
+  function followEventBody() {
+    return JSON.stringify({
+      destination: 'bot',
+      events: [
+        {
+          type: 'follow',
+          replyToken: 'reply-token',
+          timestamp: Date.now(),
+          source: { type: 'user', userId: 'U-follow' },
+          webhookEventId: 'event-follow-1',
+          deliveryContext: { isRedelivery: false },
+          mode: 'active',
+        },
+      ],
+    });
+  }
+
+  function mockFollowFriend() {
+    const friend = {
+      id: 'friend-2',
+      line_user_id: 'U-follow',
+      display_name: 'FUSAE',
+      picture_url: null,
+      status_message: null,
+      is_following: 1,
+      user_id: null,
+      line_account_id: null,
+      metadata: '{}',
+      first_tracked_link_id: null,
+      created_at: '2026-07-23T17:17:57.836+09:00',
+      updated_at: '2026-07-23T17:17:57.836+09:00',
+      // ref_code が既に付いている friend を返すことで、webhook.ts 内の
+      // ref_code 再試行ループ（getFriendById 呼び出し）を経由せずに
+      // friendRefCode が即座に解決される。
+      ref_code: 'osaka-yuka-form',
+    } as unknown as Awaited<ReturnType<typeof upsertFriend>>;
+    vi.mocked(upsertFriend).mockResolvedValue(friend);
+    return friend;
+  }
+
+  function stubDb() {
+    const stmt = {
+      bind: vi.fn(),
+      run: vi.fn().mockResolvedValue({}),
+      all: vi.fn().mockResolvedValue({ results: [] }),
+      first: vi.fn().mockResolvedValue(null),
+    };
+    stmt.bind.mockReturnValue(stmt);
+    return { prepare: vi.fn().mockReturnValue(stmt) } as unknown as D1Database;
+  }
+
+  function runFollowEvent(db: D1Database, env: Record<string, unknown> = baseEnv) {
+    const app = setupApp();
+    const validShapedSignature = 'A'.repeat(43) + '=';
+    const executionCtx = {
+      waitUntil: vi.fn(),
+      passThroughOnException: vi.fn(),
+      props: {},
+    } as unknown as ExecutionContext;
+
+    return app
+      .request(
+        '/webhook',
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'X-Line-Signature': validShapedSignature },
+          body: followEventBody(),
+        },
+        { ...env, DB: db },
+        executionCtx,
+      )
+      .then(async (res) => {
+        const processing = vi.mocked(executionCtx.waitUntil).mock.calls[0]?.[0] as Promise<unknown>;
+        await processing;
+        return res;
+      });
+  }
+
+  test('notifies the owner via pushTextMessage on follow when OWNER_NOTIFY_LINE_USER_ID is set', async () => {
+    vi.mocked(verifySignature).mockResolvedValue(true);
+    mockFollowFriend();
+    vi.mocked(getEntryRouteByRefCode).mockResolvedValue(null);
+    vi.mocked(getScenarios).mockResolvedValue([]);
+    lineClientMocks.getProfile.mockResolvedValue({
+      userId: 'U-follow',
+      displayName: 'FUSAE',
+      pictureUrl: null,
+      statusMessage: null,
+    });
+
+    const res = await runFollowEvent(stubDb(), { ...baseEnv, OWNER_NOTIFY_LINE_USER_ID: 'U-owner' });
+
+    expect(res.status).toBe(200);
+    expect(lineClientMocks.pushTextMessage).toHaveBeenCalledWith(
+      'U-owner',
+      '【通知】新しい友だちが追加されました：FUSAE（流入元：osaka-yuka-form）',
+    );
+  });
+
+  test('skips owner notification on follow when OWNER_NOTIFY_LINE_USER_ID is not set', async () => {
+    vi.mocked(verifySignature).mockResolvedValue(true);
+    mockFollowFriend();
+    vi.mocked(getEntryRouteByRefCode).mockResolvedValue(null);
+    vi.mocked(getScenarios).mockResolvedValue([]);
+    lineClientMocks.getProfile.mockResolvedValue({
+      userId: 'U-follow',
+      displayName: 'FUSAE',
+      pictureUrl: null,
+      statusMessage: null,
+    });
+
+    const res = await runFollowEvent(stubDb()); // baseEnv has no OWNER_NOTIFY_LINE_USER_ID
+
+    expect(res.status).toBe(200);
+    expect(lineClientMocks.pushTextMessage).not.toHaveBeenCalled();
   });
 });

@@ -73,6 +73,19 @@ async function ensureFriendFromWebhookUser(
   return friend;
 }
 
+async function notifyOwner(
+  lineClient: LineClient,
+  ownerUserId: string | undefined,
+  text: string,
+): Promise<void> {
+  if (!ownerUserId) return;
+  try {
+    await lineClient.pushTextMessage(ownerUserId, text);
+  } catch (err) {
+    console.error('[notifyOwner] push failed', err);
+  }
+}
+
 webhook.post('/webhook', async (c) => {
   // Pre-read size guard: reject before reading the body if Content-Length is oversized.
   const contentLengthHeader = c.req.header('Content-Length');
@@ -164,7 +177,7 @@ webhook.post('/webhook', async (c) => {
   const processingPromise = (async () => {
     for (const event of body.events) {
       try {
-        await handleEvent(db, lineClient, event, channelAccessToken, matchedAccountId, c.env.WORKER_URL || new URL(c.req.url).origin, c.env.LIFF_URL, c.env.IMAGES);
+        await handleEvent(db, lineClient, event, channelAccessToken, matchedAccountId, c.env.WORKER_URL || new URL(c.req.url).origin, c.env.LIFF_URL, c.env.IMAGES, c.env.OWNER_NOTIFY_LINE_USER_ID);
       } catch (err) {
         console.error('Error handling webhook event:', err);
       }
@@ -185,6 +198,7 @@ async function handleEvent(
   workerUrl?: string,
   liffUrl?: string,
   r2?: R2Bucket,
+  ownerNotifyUserId?: string,
 ): Promise<void> {
   if (event.type === 'follow') {
     const userId =
@@ -362,6 +376,12 @@ async function handleEvent(
 
     // イベントバス発火: friend_add（replyToken は Step 0 で使用済みの可能性あり）
     await fireEvent(db, 'friend_add', { friendId: friend.id, eventData: { displayName: friend.display_name } }, lineAccessToken, lineAccountId);
+
+    await notifyOwner(
+      lineClient,
+      ownerNotifyUserId,
+      `【通知】新しい友だちが追加されました：${friend.display_name || '(表示名なし)'}（流入元：${friendRefCode ?? 'なし'}）`,
+    );
     return;
   }
 
