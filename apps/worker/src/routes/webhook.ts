@@ -687,6 +687,12 @@ async function handleEvent(
       await upsertChatOnMessage(db, friend.id);
     }
 
+    await notifyOwner(
+      lineClient,
+      ownerNotifyUserId,
+      `【通知】${friend.display_name || '(表示名なし)'}さんからメッセージ：${incomingText}`,
+    );
+
     // イベントバス発火: message_received
     // Pass replyToken only when auto_reply didn't actually consume it
     await fireEvent(db, 'message_received', {

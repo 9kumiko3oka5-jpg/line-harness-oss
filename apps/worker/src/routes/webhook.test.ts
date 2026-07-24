@@ -298,6 +298,163 @@ describe('POST /webhook — first-contact existing friends', () => {
     expect(getEntryRouteByRefCode).not.toHaveBeenCalled();
     expect(getMessageTemplateById).not.toHaveBeenCalled();
   });
+
+  test('notifies the owner via pushTextMessage on incoming text message when OWNER_NOTIFY_LINE_USER_ID is set', async () => {
+    vi.mocked(verifySignature).mockResolvedValue(true);
+    vi.mocked(getFriendByLineUserId).mockResolvedValue(null);
+    vi.mocked(jstNow).mockReturnValue('2026-06-18T12:00:00.000+09:00');
+    lineClientMocks.getProfile.mockResolvedValue({
+      userId: 'U-existing',
+      displayName: 'Existing Friend',
+      pictureUrl: 'https://example.com/profile.jpg',
+      statusMessage: 'hello',
+    });
+    vi.mocked(upsertFriend).mockResolvedValue({
+      id: 'friend-1',
+      line_user_id: 'U-existing',
+      display_name: 'Existing Friend',
+      picture_url: 'https://example.com/profile.jpg',
+      status_message: 'hello',
+      is_following: 1,
+      user_id: null,
+      line_account_id: null,
+      metadata: '{}',
+      first_tracked_link_id: null,
+      created_at: '2026-06-18T12:00:00.000+09:00',
+      updated_at: '2026-06-18T12:00:00.000+09:00',
+    });
+    vi.mocked(upsertChatOnMessage).mockResolvedValue({
+      id: 'chat-1',
+      friend_id: 'friend-1',
+      operator_id: null,
+      status: 'unread',
+      notes: null,
+      last_message_at: '2026-06-18T12:00:00.000+09:00',
+      created_at: '2026-06-18T12:00:00.000+09:00',
+      updated_at: '2026-06-18T12:00:00.000+09:00',
+    });
+
+    const stmt = {
+      bind: vi.fn(),
+      run: vi.fn().mockResolvedValue({}),
+      all: vi.fn().mockResolvedValue({ results: [] }),
+    };
+    stmt.bind.mockReturnValue(stmt);
+    const db = { prepare: vi.fn().mockReturnValue(stmt) } as unknown as D1Database;
+
+    const executionCtx = {
+      waitUntil: vi.fn(),
+      passThroughOnException: vi.fn(),
+      props: {},
+    } as unknown as ExecutionContext;
+
+    const app = setupApp();
+    const validShapedSignature = 'A'.repeat(43) + '=';
+    const res = await app.request(
+      '/webhook',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Line-Signature': validShapedSignature },
+        body: JSON.stringify({
+          destination: 'bot',
+          events: [
+            {
+              type: 'message',
+              replyToken: 'reply-token',
+              message: { type: 'text', id: 'message-1', text: 'こんにちは' },
+              timestamp: Date.now(),
+              source: { type: 'user', userId: 'U-existing' },
+              webhookEventId: 'event-1',
+              deliveryContext: { isRedelivery: false },
+              mode: 'active',
+            },
+          ],
+        }),
+      },
+      { ...baseEnv, DB: db, OWNER_NOTIFY_LINE_USER_ID: 'U-owner' },
+      executionCtx,
+    );
+    const processing = vi.mocked(executionCtx.waitUntil).mock.calls[0]?.[0] as Promise<unknown>;
+    await processing;
+
+    expect(res.status).toBe(200);
+    expect(lineClientMocks.pushTextMessage).toHaveBeenCalledWith(
+      'U-owner',
+      '【通知】Existing Friendさんからメッセージ：こんにちは',
+    );
+  });
+
+  test('does not notify the owner for non-text messages (e.g. stickers)', async () => {
+    vi.mocked(verifySignature).mockResolvedValue(true);
+    vi.mocked(getFriendByLineUserId).mockResolvedValue(null);
+    vi.mocked(jstNow).mockReturnValue('2026-06-18T12:00:00.000+09:00');
+    lineClientMocks.getProfile.mockResolvedValue({
+      userId: 'U-existing',
+      displayName: 'Existing Friend',
+      pictureUrl: null,
+      statusMessage: null,
+    });
+    vi.mocked(upsertFriend).mockResolvedValue({
+      id: 'friend-1',
+      line_user_id: 'U-existing',
+      display_name: 'Existing Friend',
+      picture_url: null,
+      status_message: null,
+      is_following: 1,
+      user_id: null,
+      line_account_id: null,
+      metadata: '{}',
+      first_tracked_link_id: null,
+      created_at: '2026-06-18T12:00:00.000+09:00',
+      updated_at: '2026-06-18T12:00:00.000+09:00',
+    });
+
+    const stmt = {
+      bind: vi.fn(),
+      run: vi.fn().mockResolvedValue({}),
+      all: vi.fn().mockResolvedValue({ results: [] }),
+    };
+    stmt.bind.mockReturnValue(stmt);
+    const db = { prepare: vi.fn().mockReturnValue(stmt) } as unknown as D1Database;
+
+    const executionCtx = {
+      waitUntil: vi.fn(),
+      passThroughOnException: vi.fn(),
+      props: {},
+    } as unknown as ExecutionContext;
+
+    const app = setupApp();
+    const validShapedSignature = 'A'.repeat(43) + '=';
+    const res = await app.request(
+      '/webhook',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Line-Signature': validShapedSignature },
+        body: JSON.stringify({
+          destination: 'bot',
+          events: [
+            {
+              type: 'message',
+              replyToken: 'reply-token',
+              message: { type: 'sticker', id: 'message-2', packageId: '1', stickerId: '1' },
+              timestamp: Date.now(),
+              source: { type: 'user', userId: 'U-existing' },
+              webhookEventId: 'event-2',
+              deliveryContext: { isRedelivery: false },
+              mode: 'active',
+            },
+          ],
+        }),
+      },
+      { ...baseEnv, DB: db, OWNER_NOTIFY_LINE_USER_ID: 'U-owner' },
+      executionCtx,
+    );
+    const processing = vi.mocked(executionCtx.waitUntil).mock.calls[0]?.[0] as Promise<unknown>;
+    await processing;
+
+    expect(res.status).toBe(200);
+    expect(lineClientMocks.pushTextMessage).not.toHaveBeenCalled();
+  });
 });
 
 describe('POST /webhook — owner notification', () => {
