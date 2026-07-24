@@ -574,4 +574,35 @@ describe('POST /webhook — owner notification', () => {
     expect(res.status).toBe(200);
     expect(lineClientMocks.pushTextMessage).not.toHaveBeenCalled();
   });
+
+  test('owner notification failure does not break friend registration or fireEvent', async () => {
+    vi.mocked(verifySignature).mockResolvedValue(true);
+    mockFollowFriend();
+    vi.mocked(getEntryRouteByRefCode).mockResolvedValue(null);
+    vi.mocked(getScenarios).mockResolvedValue([]);
+    lineClientMocks.getProfile.mockResolvedValue({
+      userId: 'U-follow',
+      displayName: 'FUSAE',
+      pictureUrl: null,
+      statusMessage: null,
+    });
+    lineClientMocks.pushTextMessage.mockRejectedValueOnce(new Error('LINE API 500'));
+
+    const res = await runFollowEvent(stubDb(), { ...baseEnv, OWNER_NOTIFY_LINE_USER_ID: 'U-owner' });
+    // runFollowEvent already awaits the waitUntil-tracked processing promise;
+    // if notifyOwner didn't catch its own rejection, that await would throw here.
+
+    expect(res.status).toBe(200);
+    expect(lineClientMocks.pushTextMessage).toHaveBeenCalledWith(
+      'U-owner',
+      '【通知】新しい友だちが追加されました：FUSAE（流入元：osaka-yuka-form）',
+    );
+    expect(fireEvent).toHaveBeenCalledWith(
+      expect.anything(),
+      'friend_add',
+      expect.objectContaining({ friendId: 'friend-2' }),
+      'env-default-token',
+      null,
+    );
+  });
 });
