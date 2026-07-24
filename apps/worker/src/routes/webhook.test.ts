@@ -13,6 +13,7 @@ vi.mock('@line-crm/db', () => ({
   upsertFriend: vi.fn(),
   updateFriendFollowStatus: vi.fn(),
   getFriendByLineUserId: vi.fn(),
+  getFriendById: vi.fn(),
   getScenarios: vi.fn(),
   enrollFriendInScenario: vi.fn(),
   getScenarioSteps: vi.fn(),
@@ -44,6 +45,7 @@ vi.mock('../services/event-bus.js', () => ({
 vi.mock('../services/step-delivery.js', () => ({
   buildMessage: vi.fn(),
   expandVariables: vi.fn(),
+  messageToLogPayload: vi.fn(),
 }));
 
 import { verifySignature } from '@line-crm/line-sdk';
@@ -66,6 +68,7 @@ import {
   upsertFriend,
 } from '@line-crm/db';
 import { fireEvent } from '../services/event-bus.js';
+import { buildMessage, messageToLogPayload } from '../services/step-delivery.js';
 import { webhook } from './webhook.js';
 
 function setupApp() {
@@ -295,5 +298,172 @@ describe('POST /webhook — first-contact existing friends', () => {
     expect(addTagToFriend).not.toHaveBeenCalled();
     expect(getEntryRouteByRefCode).not.toHaveBeenCalled();
     expect(getMessageTemplateById).not.toHaveBeenCalled();
+  });
+});
+
+describe('POST /webhook — follow event referral intro push', () => {
+  function followEventBody() {
+    return JSON.stringify({
+      destination: 'bot',
+      events: [
+        {
+          type: 'follow',
+          replyToken: 'reply-token',
+          timestamp: Date.now(),
+          source: { type: 'user', userId: 'U-follow' },
+          webhookEventId: 'event-follow-1',
+          deliveryContext: { isRedelivery: false },
+          mode: 'active',
+        },
+      ],
+    });
+  }
+
+  function mockFollowFriend() {
+    const friend = {
+      id: 'friend-2',
+      line_user_id: 'U-follow',
+      display_name: 'FUSAE',
+      picture_url: null,
+      status_message: null,
+      is_following: 1,
+      user_id: null,
+      line_account_id: null,
+      metadata: '{}',
+      first_tracked_link_id: null,
+      created_at: '2026-07-23T17:17:57.836+09:00',
+      updated_at: '2026-07-23T17:17:57.836+09:00',
+      // /auth/callback already wrote ref_code before this follow webhook ran
+      // (the retry-loop race in webhook.ts is a separate concern from the
+      // dedupe logic under test here).
+      ref_code: 'osaka-yuka-form',
+    } as unknown as Awaited<ReturnType<typeof upsertFriend>>;
+    vi.mocked(upsertFriend).mockResolvedValue(friend);
+    return friend;
+  }
+
+  const referralRoute = {
+    id: 'route-1',
+    ref_code: 'osaka-yuka-form',
+    name: '大阪骨盤ネジ締め-フォーム申込後',
+    tag_id: null,
+    scenario_id: null,
+    redirect_url: null,
+    pool_id: null,
+    intro_template_id: 'tmpl-1',
+    run_account_friend_add_scenarios: 1,
+    is_active: 1,
+    created_at: '2026-01-01T00:00:00.000+09:00',
+    updated_at: '2026-01-01T00:00:00.000+09:00',
+  };
+
+  const template = {
+    id: 'tmpl-1',
+    name: '①大阪-申込済み',
+    message_type: 'text' as const,
+    message_content: 'ようこそ！',
+    created_at: '2026-01-01T00:00:00.000+09:00',
+    updated_at: '2026-01-01T00:00:00.000+09:00',
+  };
+
+  function runFollowEvent(db: D1Database) {
+    const app = setupApp();
+    const validShapedSignature = 'A'.repeat(43) + '=';
+    const executionCtx = {
+      waitUntil: vi.fn(),
+      passThroughOnException: vi.fn(),
+      props: {},
+    } as unknown as ExecutionContext;
+
+    return app
+      .request(
+        '/webhook',
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'X-Line-Signature': validShapedSignature },
+          body: followEventBody(),
+        },
+        { ...baseEnv, DB: db },
+        executionCtx,
+      )
+      .then(async (res) => {
+        const processing = vi.mocked(executionCtx.waitUntil).mock.calls[0]?.[0] as Promise<unknown>;
+        await processing;
+        return res;
+      });
+  }
+
+  test('sends the entry_route intro push and logs it to messages_log when never sent before', async () => {
+    vi.mocked(verifySignature).mockResolvedValue(true);
+    vi.mocked(jstNow).mockReturnValue('2026-07-23T17:17:59.457+09:00');
+    mockFollowFriend();
+    vi.mocked(getEntryRouteByRefCode).mockResolvedValue(referralRoute);
+    vi.mocked(getScenarios).mockResolvedValue([]);
+    vi.mocked(getMessageTemplateById).mockResolvedValue(template);
+    vi.mocked(buildMessage).mockReturnValue({ type: 'text', text: 'ようこそ！' });
+    vi.mocked(messageToLogPayload).mockReturnValue({ messageType: 'text', content: 'ようこそ！' });
+    lineClientMocks.getProfile.mockResolvedValue({
+      userId: 'U-follow',
+      displayName: 'FUSAE',
+      pictureUrl: null,
+      statusMessage: null,
+    });
+
+    const stmt = {
+      bind: vi.fn(),
+      run: vi.fn().mockResolvedValue({}),
+      all: vi.fn().mockResolvedValue({ results: [] }),
+      // No prior entry_route_intro row for this friend/template — the push
+      // must proceed.
+      first: vi.fn().mockResolvedValue(null),
+    };
+    stmt.bind.mockReturnValue(stmt);
+    const db = { prepare: vi.fn().mockReturnValue(stmt) } as unknown as D1Database;
+
+    const res = await runFollowEvent(db);
+
+    expect(res.status).toBe(200);
+    expect(lineClientMocks.pushMessage).toHaveBeenCalledWith('U-follow', [{ type: 'text', text: 'ようこそ！' }]);
+    expect(stmt.run).toHaveBeenCalledTimes(1); // the messages_log INSERT
+    expect(stmt.bind).toHaveBeenCalledWith(
+      expect.any(String),
+      'friend-2',
+      'text',
+      'ようこそ！',
+      'tmpl-1',
+      '2026-07-23T17:17:59.457+09:00',
+    );
+  });
+
+  test('skips the intro push when messages_log already has a matching entry_route_intro row (dedupe)', async () => {
+    vi.mocked(verifySignature).mockResolvedValue(true);
+    vi.mocked(jstNow).mockReturnValue('2026-07-23T17:17:59.457+09:00');
+    mockFollowFriend();
+    vi.mocked(getEntryRouteByRefCode).mockResolvedValue(referralRoute);
+    vi.mocked(getScenarios).mockResolvedValue([]);
+    lineClientMocks.getProfile.mockResolvedValue({
+      userId: 'U-follow',
+      displayName: 'FUSAE',
+      pictureUrl: null,
+      statusMessage: null,
+    });
+
+    const stmt = {
+      bind: vi.fn(),
+      run: vi.fn().mockResolvedValue({}),
+      all: vi.fn().mockResolvedValue({ results: [] }),
+      // /auth/callback (applyRefAttribution) already sent and logged this
+      // intro — the follow webhook must not send it again.
+      first: vi.fn().mockResolvedValue({ 1: 1 }),
+    };
+    stmt.bind.mockReturnValue(stmt);
+    const db = { prepare: vi.fn().mockReturnValue(stmt) } as unknown as D1Database;
+
+    const res = await runFollowEvent(db);
+
+    expect(res.status).toBe(200);
+    expect(getMessageTemplateById).not.toHaveBeenCalled();
+    expect(lineClientMocks.pushMessage).not.toHaveBeenCalled();
+    expect(stmt.run).not.toHaveBeenCalled();
   });
 });

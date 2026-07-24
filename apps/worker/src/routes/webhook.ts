@@ -335,14 +335,37 @@ async function handleEvent(
 
     // Referral link side-effects (intro push + dedicated scenario)
     if (referralRoute) {
-      // Intro push from referral link
+      // Intro push from referral link.
+      // /auth/callback (applyRefAttribution in liff.ts) sends this same push
+      // when the OAuth flow resolves ref_code before this follow webhook does
+      // (see the ref_code retry loop above) — check messages_log first so
+      // whichever side loses the race doesn't double-send.
       if (referralRoute.intro_template_id) {
         try {
-          const template = await getMessageTemplateById(db, referralRoute.intro_template_id);
-          if (template) {
-            const message = buildMessage(template.message_type, template.message_content);
-            await lineClient.pushMessage(userId, [message]);
-            console.log(`[follow] referral intro push sent route=${referralRoute.id}`);
+          const alreadySent = await db
+            .prepare(
+              `SELECT 1 FROM messages_log
+               WHERE friend_id = ? AND source = 'entry_route_intro' AND template_id_at_send = ?
+               LIMIT 1`,
+            )
+            .bind(friend.id, referralRoute.intro_template_id)
+            .first();
+          if (!alreadySent) {
+            const template = await getMessageTemplateById(db, referralRoute.intro_template_id);
+            if (template) {
+              const message = buildMessage(template.message_type, template.message_content);
+              await lineClient.pushMessage(userId, [message]);
+              console.log(`[follow] referral intro push sent route=${referralRoute.id}`);
+              const { messageToLogPayload } = await import('../services/step-delivery.js');
+              const introLogPayload = messageToLogPayload(message);
+              await db
+                .prepare(
+                  `INSERT INTO messages_log (id, friend_id, direction, message_type, content, broadcast_id, scenario_step_id, delivery_type, source, template_id_at_send, created_at)
+                   VALUES (?, ?, 'outgoing', ?, ?, NULL, NULL, 'push', 'entry_route_intro', ?, ?)`,
+                )
+                .bind(crypto.randomUUID(), friend.id, introLogPayload.messageType, introLogPayload.content, referralRoute.intro_template_id, jstNow())
+                .run();
+            }
           }
         } catch (err) {
           console.error('[follow] referral intro push failed', err);

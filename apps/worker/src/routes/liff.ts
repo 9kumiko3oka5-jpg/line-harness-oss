@@ -133,6 +133,53 @@ async function applyRefAttribution(
   if (effectiveTagId) {
     await addTagToFriend(db, friend.id, effectiveTagId);
   }
+
+  // Immediate intro push from an entry_route's intro_template_id (independent
+  // of scenario_id — e.g. a route can set only intro_template_id with no
+  // scenario). The follow webhook (webhook.ts) sends this same push when it
+  // wins the race against this OAuth callback for friends.ref_code; check
+  // messages_log first so whichever side loses the race doesn't double-send.
+  if (route?.intro_template_id) {
+    try {
+      const alreadySent = await db
+        .prepare(
+          `SELECT 1 FROM messages_log
+           WHERE friend_id = ? AND source = 'entry_route_intro' AND template_id_at_send = ?
+           LIMIT 1`,
+        )
+        .bind(friend.id, route.intro_template_id)
+        .first();
+      if (!alreadySent) {
+        const template = await getMessageTemplateById(db, route.intro_template_id);
+        if (template) {
+          const { LineClient } = await import('@line-crm/line-sdk');
+          const { buildMessage, messageToLogPayload } = await import('../services/step-delivery.js');
+          let accessToken = c.env.LINE_CHANNEL_ACCESS_TOKEN;
+          if (options?.accountChannelId) {
+            const acct = await getLineAccountByChannelId(db, options.accountChannelId);
+            if (acct?.channel_access_token) accessToken = acct.channel_access_token;
+          } else if (friend.line_account_id) {
+            const acct = await getLineAccountById(db, friend.line_account_id);
+            if (acct?.channel_access_token) accessToken = acct.channel_access_token;
+          }
+          const lineClient = new LineClient(accessToken);
+          const message = buildMessage(template.message_type, template.message_content);
+          await lineClient.pushMessage(lineUserId, [message]);
+          const introLogPayload = messageToLogPayload(message);
+          await db
+            .prepare(
+              `INSERT INTO messages_log (id, friend_id, direction, message_type, content, broadcast_id, scenario_step_id, delivery_type, source, template_id_at_send, created_at)
+               VALUES (?, ?, 'outgoing', ?, ?, NULL, NULL, 'push', 'entry_route_intro', ?, ?)`,
+            )
+            .bind(crypto.randomUUID(), friend.id, introLogPayload.messageType, introLogPayload.content, route.intro_template_id, jstNow())
+            .run();
+        }
+      }
+    } catch (err) {
+      console.error('[applyRefAttribution] entry route intro push failed', err);
+    }
+  }
+
   if (effectiveScenarioId) {
     try {
       const {
