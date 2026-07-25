@@ -86,6 +86,10 @@ export type Env = {
     API_KEY: string;
     LEGACY_API_KEY?: string;
     LIFF_URL: string;
+    // オーナー個人のLINE User ID。設定時、follow/message(text)イベント発生ごとに
+    // Messaging API 経由でプッシュ通知を送る（フェーズ①: 気づける状態を作る）。
+    // wrangler secret put で設定。未設定時は通知処理をスキップする。
+    OWNER_NOTIFY_LINE_USER_ID?: string;
     LINE_CHANNEL_ID: string;
     LINE_LOGIN_CHANNEL_ID: string;
     LINE_LOGIN_CHANNEL_SECRET: string;
