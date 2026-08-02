@@ -65,6 +65,7 @@ import { setup } from './routes/setup.js';
 import { autoReplies } from './routes/auto-replies.js';
 import { adminAuth } from './routes/admin-auth.js';
 import { resolveCorsOrigin } from './middleware/admin-auth-config.js';
+import { apiNoStoreCacheMiddleware } from './middleware/api-cache-control.js';
 import booking from './routes/booking.js';
 import events from './routes/events.js';
 import { trafficPools } from './routes/traffic-pools.js';
@@ -124,6 +125,9 @@ export type Env = {
 };
 
 const app = new Hono<Env>();
+
+// Admin/API responses reflect mutable D1 state and must not be browser-cached.
+app.use('/api/*', apiNoStoreCacheMiddleware);
 
 // CORS — credentialed cookie auth cannot use a wildcard origin. Reflect only
 // same-origin requests and origins on the ADMIN_ORIGIN allowlist; everything
