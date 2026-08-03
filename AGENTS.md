@@ -35,11 +35,21 @@ pnpm workspaces によるモノレポ構成（`pnpm-workspace.yaml`: `apps/*`, `
 
 ## 開発・デプロイ時の注意点
 
-- **このリポジトリは `Shudesu/line-harness-oss` のフォーク。GitHub ActionsはGitHubの仕様でフォークではデフォルト無効化されており、本リポジトリでは一度も実行されたことがない**（`gh api repos/{owner}/{repo}/actions/runs` で確認可能、`total_count: 0`）。`main`にpushしても自動デプロイは走らない。本番デプロイは手動で行う:
+- **GitHub Actions運用状況**: 2026-07-25時点では、このリポジトリ
+  (`9kumiko3oka5-jpg/line-harness-oss`) は `Shudesu/line-harness-oss` のフォークであり、
+  GitHubの仕様でActionsがデフォルト無効化されていたため、`main`にpushしても自動デプロイ
+  は走らず、本番デプロイは手動運用だった:
   ```
   cd apps/worker && pnpm run build && npx wrangler deploy
   ```
-  これはトップレベルの `wrangler.toml`（`name = "line-harness"`）を使う。**`--env production` は使わないこと** — `wrangler.toml`の`[env.production]`セクションは実際のCIデプロイ経路（`.github/workflows/deploy-cloudflare-worker.yml`、無効化中）専用の設定であり、ローカルから`--env production`を付けると別名のWorker（`line-harness-production`）を新規作成しようとする（2026-07-25に実際に誤作成し削除する事態が発生した）。
+  **2026-08-03現在はGitHub Actionsを有効化済み**。Repository Secrets/Variablesを登録し、
+  `LINE_HARNESS_CLOUDFLARE_DEPLOY=true` により
+  `.github/workflows/deploy-cloudflare-worker.yml` は `main` pushまたは
+  `workflow_dispatch` から本番WorkerへDeployできる状態。`Deploy Cloudflare Worker #3`
+  の成功を確認済み。ローカルから手動デプロイする場合はトップレベルの `wrangler.toml`
+  （`name = "line-harness"`）を使う。**`--env production` は使わないこと** —
+  ローカルから`--env production`を付けると別名のWorker（`line-harness-production`）を
+  新規作成しようとする（2026-07-25に実際に誤作成し削除する事態が発生した）。
 - **D1マイグレーションの本番適用状況は必ず実データで確認する**。ローカルのファイル一覧と本番`_migrations`テーブルは乖離しうる:
   ```
   npx wrangler d1 execute line-crm --remote --command "SELECT name, applied_at FROM _migrations ORDER BY name DESC LIMIT 10"
