@@ -13,6 +13,10 @@
 - 既存の成果物を大幅に書き換える前は、何をどう変えるか予告してから着手する。
 - Playwrightで管理画面(line-harness-admin-cek.pages.dev)を操作する際は、まずスクリーンショットや表示確認など見るだけの操作から行い、データを作成・変更・削除する操作(友だち追加、配信実行、削除など)は必ず一つずつ内容を説明してから実行の許可を得ること。
 
+## 作業開始時の確認
+
+- 作業開始時は必ず `docs/PROJECT_STATUS.md` を読み、直近の復旧状況・未解決事項・運用変更を確認する。このファイルを引き継ぎ情報の正本として扱う。
+
 <!--
 以下「技術スタック・アーキテクチャ」〜「開発・デプロイ時の注意点」セクションは
 AGENTS.md（Codex CLI等が読む規約ファイル）にも同一内容を複製している。
@@ -43,11 +47,30 @@ pnpm workspaces によるモノレポ構成（`pnpm-workspace.yaml`: `apps/*`, `
 
 ## 開発・デプロイ時の注意点
 
-- **このリポジトリは `Shudesu/line-harness-oss` のフォーク。GitHub ActionsはGitHubの仕様でフォークではデフォルト無効化されており、本リポジトリでは一度も実行されたことがない**（`gh api repos/{owner}/{repo}/actions/runs` で確認可能、`total_count: 0`）。`main`にpushしても自動デプロイは走らない。本番デプロイは手動で行う:
+- **GitHub Actions運用状況**: 2026-07-25時点では、このリポジトリ
+  (`9kumiko3oka5-jpg/line-harness-oss`) は `Shudesu/line-harness-oss` のフォークであり、
+  GitHubの仕様でActionsがデフォルト無効化されていたため、`main`にpushしても自動デプロイ
+  は走らず、本番デプロイは手動運用だった:
   ```
   cd apps/worker && pnpm run build && npx wrangler deploy
   ```
-  これはトップレベルの `wrangler.toml`（`name = "line-harness"`）を使う。**`--env production` は使わないこと** — `wrangler.toml`の`[env.production]`セクションは実際のCIデプロイ経路（`.github/workflows/deploy-cloudflare-worker.yml`、無効化中）専用の設定であり、ローカルから`--env production`を付けると別名のWorker（`line-harness-production`）を新規作成しようとする（2026-07-25に実際に誤作成し削除する事態が発生した）。
+  **2026-08-03現在はGitHub Actionsを有効化済み**。Repository Secrets/Variablesを登録し、
+  `LINE_HARNESS_CLOUDFLARE_DEPLOY=true` により
+  `.github/workflows/deploy-cloudflare-worker.yml` は `main` pushまたは
+  `workflow_dispatch` から本番WorkerへDeployできる状態。`Deploy Cloudflare Worker #3`
+  の成功を確認済み。ローカルから手動デプロイする場合はトップレベルの `wrangler.toml`
+  （`name = "line-harness"`）を使う。**`--env production` は使わないこと** —
+  ローカルから`--env production`を付けると別名のWorker（`line-harness-production`）を
+  新規作成しようとする（2026-07-25に実際に誤作成し削除する事態が発生した）。
+- **LIFF復旧状況（2026-08-03）**: 新しいLINE Loginチャネル
+  `骨盤ネジ締め® 申込・ご案内` と新LIFF ID `2010944622-92mAoJXV` で復旧済み。
+  旧LIFF ID `2009699948-0ehzl675` / `2009699948-uH05jAc7` は履歴・テスト資料に残る場合が
+  あるが、現在の本番運用には使用しない。原因はGitHub Actions Variablesに
+  `VITE_LIFF_ID` が未登録で、Deploy成功後も公開JavaScript内のLIFF IDが空になり
+  「読み込み中…」で停止していたこと。`VITE_LIFF_ID` 登録後、`Deploy Cloudflare Worker #3`
+  がSuccessとなり、新LIFFで「おかえりなさい！kumi♪さん」の表示、申込み処理、
+  LINE公式アカウントへの復帰、受付メッセージ受信まで実機確認済み。SecretやAPIトークンの
+  実値は記録しない。
 - **D1マイグレーションの本番適用状況は必ず実データで確認する**。ローカルのファイル一覧と本番`_migrations`テーブルは乖離しうる:
   ```
   npx wrangler d1 execute line-crm --remote --command "SELECT name, applied_at FROM _migrations ORDER BY name DESC LIMIT 10"
