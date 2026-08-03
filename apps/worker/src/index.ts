@@ -271,11 +271,10 @@ app.get('/r/:ref', async (c) => {
     }
   }
 
-  // Build LIFF URL with params (direct link for Universal Link)
-  const liffIdMatch = liffUrl.match(/liff\.line\.me\/([0-9]+-[A-Za-z0-9]+)/);
+  // Build LIFF URL using LIFF path routing so LINE opens the in-app endpoint
+  // directly as /r/:ref instead of falling back into browser login.
+  const liffBaseUrl = liffUrl.replace(/\/+$/, '');
   const liffParams = new URLSearchParams();
-  if (liffIdMatch) liffParams.set('liffId', liffIdMatch[1]);
-  if (ref) liffParams.set('ref', ref);
   if (formId) liffParams.set('form', formId);
   const gate = c.req.query('gate');
   if (gate) liffParams.set('gate', gate);
@@ -283,7 +282,8 @@ app.get('/r/:ref', async (c) => {
   if (xh) liffParams.set('xh', xh);
   const ig = c.req.query('ig');
   if (ig) liffParams.set('ig', ig);
-  const liffTarget = liffParams.toString() ? `${liffUrl}?${liffParams.toString()}` : liffUrl;
+  const liffQuery = liffParams.toString();
+  const liffTarget = `${liffBaseUrl}/r/${encodeURIComponent(ref)}${liffQuery ? '?' + liffQuery : ''}`;
 
   // Help link carries the *resolved* liff target as `t=` so the help page
   // displays the exact URL the user should paste into a real browser. Without
