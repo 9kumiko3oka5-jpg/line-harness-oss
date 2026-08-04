@@ -4,6 +4,48 @@
 技術的な文脈を共有するための記録。更新時は日付を追記し、古い情報は削除せず
 「解決済み」「対応不要になった」等を明記して残す。
 
+## 2026-08-05: LIFF紹介導線のリダイレクトループを修正・本番Deploy済み
+
+- **対象**:
+  - 大阪LINEグループ用: `/r/osaka-yuka-form`
+  - 大阪一般用: `/r/osaka-general-form`
+  - 東京一般用: `/r/tokyo-form`
+- **症状**: 第三者端末でWorkers側の固定URL（例:
+  `https://line-harness.9kumiko3oka5.workers.dev/r/osaka-yuka-form`）を開くと、
+  画面上段の表示が「LINEで開く」と「LINE CRM」で数秒ごとに切り替わり、申込みへ進めない。
+- **原因**: コミット`14ba315`で`/r/:ref`のLIFF遷移先を
+  `https://liff.line.me/2010944622-92mAoJXV/r/{ref}` のpath形式へ変更したため、
+  LIFF起動後もWorkerの同じ`/r/{ref}`ルートを再表示し、Workers中継画面とLIFF本体の間で
+  循環する構造になっていた。
+- **修正**: コミット`46060f6`
+  (`fix(worker): stop LIFF referral redirect loop`)で、Googleフォームに設定済みの
+  Workers固定URL `/r/{ref}` は変更せず、`LINEで開く`ボタン・Android intent・PC QRが指す
+  LIFF URLだけをquery形式へ戻した。生成例:
+  `https://liff.line.me/2010944622-92mAoJXV?liffId=2010944622-92mAoJXV&ref=osaka-yuka-form`。
+  `ref`で申込み導線を保持し、`form`/`gate`/`xh`/`ig`も既存どおりLIFF側へ引き継ぐ。
+  HTML属性へのURL埋め込みは`&`等をエスケープするようにした。
+- **テスト結果（このMac環境で再実行）**:
+  - `cd apps/worker && npx vitest run src/ref-route.test.ts` → 4 tests success。
+  - `cd apps/worker && npx tsc --noEmit -p .` → success。
+  - `cd apps/worker && npx vitest run` → 50 files / 557 tests success。
+  - `cd apps/worker && pnpm run build` → success。Wranglerのローカルログ書き込みだけ
+    sandbox権限でEPERMが出たが、ビルド自体は終了コード0で生成物作成完了。
+- **Deploy結果**: GitHub Actions `Deploy Cloudflare Worker #4`
+  （run `30927382864`、commit `46060f6`）がSuccess。workflow内の
+  `Run pending D1 migrations`、`Build Worker and LIFF assets`、
+  `Deploy to Cloudflare Workers` の各stepもSuccess。
+- **本番機械確認**:
+  - 本番Worker `/` はHTTP 200で応答。
+  - iPhone UAで3導線を取得し、`LINEで開く`のhrefが
+    `https://liff.line.me/2010944622-92mAoJXV?liffId=2010944622-92mAoJXV&ref={ref}`
+    形式であることを確認。
+  - Android UAで3導線を取得し、intent URLとfallback URLが同じquery形式で、
+    `2010944622-92mAoJXV/r/{ref}` を含まないことを確認。
+  - `?form=lesson-form-id&gate=autumn-2026&ig=ig-session`付きでも、
+    3導線すべてで`ref`/`form`/`gate`/`ig`が維持されることを確認。
+- **運用メモ**: Googleフォーム側の3つの固定URLは変更不要。第三者実機での最終成功確認は
+  機械確認後の残タスクであり、実機成功までは「完全復旧」と断定しない。
+
 ## 2026-08-03: LIFF「読み込み中」停止問題 → GitHub Actions設定補完と新LIFFで復旧確認済み
 
 - **対象**: `https://line-harness.9kumiko3oka5.workers.dev/r/osaka-general-form`。
