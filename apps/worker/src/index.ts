@@ -271,10 +271,15 @@ app.get('/r/:ref', async (c) => {
     }
   }
 
-  // Build LIFF URL using LIFF path routing so LINE opens the in-app endpoint
-  // directly as /r/:ref instead of falling back into browser login.
+  // Build LIFF URL with query routing. The public /r/:ref URL remains the
+  // fixed Google Form destination, but the LIFF URL must not append the same
+  // /r/:ref path after the LIFF ID. Doing so makes LIFF load this Worker route
+  // again and creates a loop between the landing page and LIFF.
   const liffBaseUrl = liffUrl.replace(/\/+$/, '');
   const liffParams = new URLSearchParams();
+  const liffIdMatch = liffBaseUrl.match(/liff\.line\.me\/([0-9]+-[A-Za-z0-9]+)/);
+  if (liffIdMatch) liffParams.set('liffId', liffIdMatch[1]);
+  liffParams.set('ref', ref);
   if (formId) liffParams.set('form', formId);
   const gate = c.req.query('gate');
   if (gate) liffParams.set('gate', gate);
@@ -283,7 +288,7 @@ app.get('/r/:ref', async (c) => {
   const ig = c.req.query('ig');
   if (ig) liffParams.set('ig', ig);
   const liffQuery = liffParams.toString();
-  const liffTarget = `${liffBaseUrl}/r/${encodeURIComponent(ref)}${liffQuery ? '?' + liffQuery : ''}`;
+  const liffTarget = liffQuery ? `${liffBaseUrl}?${liffQuery}` : liffBaseUrl;
 
   // Help link carries the *resolved* liff target as `t=` so the help page
   // displays the exact URL the user should paste into a real browser. Without
@@ -296,6 +301,12 @@ app.get('/r/:ref', async (c) => {
   const isMobile = /iphone|ipad|android|mobile/.test(ua);
   const isIOS = /iphone|ipad|ipod/.test(ua);
   const isAndroid = /android/.test(ua);
+  const escapeHtmlAttr = (s: string) =>
+    s.replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
 
   if (isMobile) {
     // OS-aware mobile UI. Per-browser detection (X / IG / FB) intentionally avoided —
@@ -350,9 +361,9 @@ body{font-family:'Hiragino Sans','Helvetica Neue',system-ui,sans-serif;backgroun
 <svg viewBox="0 0 48 48" fill="none"><rect width="48" height="48" rx="12" fill="#06C755"/><path d="M24 12C17.37 12 12 16.58 12 22.2c0 3.54 2.35 6.65 5.86 8.47-.2.74-.76 2.75-.87 3.17-.14.55.2.54.42.39.18-.12 2.84-1.88 4-2.65.84.13 1.7.22 2.59.22 6.63 0 12-4.58 12-10.2S30.63 12 24 12z" fill="#fff"/></svg>
 </div>
 <p class="msg">友達追加して始める</p>
-<a href="${buttonHref}" class="btn">LINEで開く</a>
+<a href="${escapeHtmlAttr(buttonHref)}" class="btn">LINEで開く</a>
 ${longPressHint}
-<p class="help">うまく開けない方は <a href="${helpUrl}">こちら</a></p>
+<p class="help">うまく開けない方は <a href="${escapeHtmlAttr(helpUrl)}">こちら</a></p>
 </div>
 </body>
 </html>`);

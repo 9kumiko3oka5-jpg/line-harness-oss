@@ -29,16 +29,34 @@ const baseEnv = {
 
 const routeCases = [
   {
-    ref: 'osaka-general-form',
-    target: 'https://liff.line.me/2010944622-92mAoJXV/r/osaka-general-form',
+    label: '大阪LINEグループ用',
+    ref: 'osaka-yuka-form',
+    target:
+      'https://liff.line.me/2010944622-92mAoJXV?liffId=2010944622-92mAoJXV&ref=osaka-yuka-form',
+    htmlTarget:
+      'https://liff.line.me/2010944622-92mAoJXV?liffId=2010944622-92mAoJXV&amp;ref=osaka-yuka-form',
     encodedTarget:
-      'https%3A%2F%2Fliff.line.me%2F2010944622-92mAoJXV%2Fr%2Fosaka-general-form',
+      'https%3A%2F%2Fliff.line.me%2F2010944622-92mAoJXV%3FliffId%3D2010944622-92mAoJXV%26ref%3Dosaka-yuka-form',
   },
   {
-    ref: 'tokyo-form',
-    target: 'https://liff.line.me/2010944622-92mAoJXV/r/tokyo-form',
+    label: '大阪一般用',
+    ref: 'osaka-general-form',
+    target:
+      'https://liff.line.me/2010944622-92mAoJXV?liffId=2010944622-92mAoJXV&ref=osaka-general-form',
+    htmlTarget:
+      'https://liff.line.me/2010944622-92mAoJXV?liffId=2010944622-92mAoJXV&amp;ref=osaka-general-form',
     encodedTarget:
-      'https%3A%2F%2Fliff.line.me%2F2010944622-92mAoJXV%2Fr%2Ftokyo-form',
+      'https%3A%2F%2Fliff.line.me%2F2010944622-92mAoJXV%3FliffId%3D2010944622-92mAoJXV%26ref%3Dosaka-general-form',
+  },
+  {
+    label: '東京一般用',
+    ref: 'tokyo-form',
+    target:
+      'https://liff.line.me/2010944622-92mAoJXV?liffId=2010944622-92mAoJXV&ref=tokyo-form',
+    htmlTarget:
+      'https://liff.line.me/2010944622-92mAoJXV?liffId=2010944622-92mAoJXV&amp;ref=tokyo-form',
+    encodedTarget:
+      'https%3A%2F%2Fliff.line.me%2F2010944622-92mAoJXV%3FliffId%3D2010944622-92mAoJXV%26ref%3Dtokyo-form',
   },
 ];
 
@@ -60,7 +78,7 @@ describe('/r/:ref LIFF target', () => {
     vi.mocked(getPoolAccounts).mockReset().mockResolvedValue([]);
   });
 
-  it('uses path-style LIFF URL for the mobile LINE button', async () => {
+  it('uses query-style LIFF URL for the mobile LINE button without re-entering /r/:ref', async () => {
     for (const routeCase of routeCases) {
       const res = await fetchRoute(
         `/r/${routeCase.ref}`,
@@ -69,13 +87,13 @@ describe('/r/:ref LIFF target', () => {
       const html = await res.text();
 
       expect(res.status).toBe(200);
-      expect(html).toContain(`href="${routeCase.target}"`);
-      expect(html).not.toContain(`?liffId=2010944622-92mAoJXV&amp;ref=${routeCase.ref}`);
-      expect(html).not.toContain(`?liffId=2010944622-92mAoJXV&ref=${routeCase.ref}`);
+      expect(html).toContain(`href="${routeCase.htmlTarget}"`);
+      expect(html).not.toContain(`/2010944622-92mAoJXV/r/${routeCase.ref}`);
+      expect(html).not.toContain(`/r/${routeCase.ref}">LINEで開く`);
     }
   });
 
-  it('uses path-style LIFF URL inside the Android intent and fallback URL', async () => {
+  it('uses query-style LIFF URL inside the Android intent and fallback URL', async () => {
     for (const routeCase of routeCases) {
       const res = await fetchRoute(
         `/r/${routeCase.ref}`,
@@ -85,14 +103,14 @@ describe('/r/:ref LIFF target', () => {
 
       expect(res.status).toBe(200);
       expect(html).toContain(
-        `href="intent://liff.line.me/2010944622-92mAoJXV/r/${routeCase.ref}#Intent;`,
+        `href="intent://liff.line.me/2010944622-92mAoJXV?liffId=2010944622-92mAoJXV&amp;ref=${routeCase.ref}#Intent;`,
       );
       expect(html).toContain(`S.browser_fallback_url=${routeCase.encodedTarget}`);
-      expect(html).not.toContain('?liffId=2010944622-92mAoJXV');
+      expect(html).not.toContain(`/2010944622-92mAoJXV/r/${routeCase.ref}`);
     }
   });
 
-  it('encodes path-style LIFF URL in the desktop QR code', async () => {
+  it('encodes query-style LIFF URL in the desktop QR code', async () => {
     for (const routeCase of routeCases) {
       const res = await fetchRoute(
         `/r/${routeCase.ref}`,
@@ -102,9 +120,24 @@ describe('/r/:ref LIFF target', () => {
 
       expect(res.status).toBe(200);
       expect(html).toContain(`/api/qr?size=240x240&data=${routeCase.encodedTarget}`);
-      expect(html).not.toContain(
-        'data=https%3A%2F%2Fliff.line.me%2F2010944622-92mAoJXV%3FliffId%3D',
+      expect(html).not.toContain(`%2F2010944622-92mAoJXV%2Fr%2F${routeCase.ref}`);
+    }
+  });
+
+  it('preserves form and each referral route in the LIFF query string', async () => {
+    for (const routeCase of routeCases) {
+      const res = await fetchRoute(
+        `/r/${routeCase.ref}?form=lesson-form-id&gate=autumn-2026&ig=ig-session`,
+        'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)',
       );
+      const html = await res.text();
+
+      expect(res.status).toBe(200);
+      expect(html).toContain(`ref=${routeCase.ref}`);
+      expect(html).toContain('form=lesson-form-id');
+      expect(html).toContain('gate=autumn-2026');
+      expect(html).toContain('ig=ig-session');
+      expect(html).not.toContain(`/2010944622-92mAoJXV/r/${routeCase.ref}`);
     }
   });
 });
