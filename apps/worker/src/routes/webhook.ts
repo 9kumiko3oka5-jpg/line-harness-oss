@@ -205,6 +205,7 @@ async function handleEvent(
       event.source.type === 'user' ? event.source.userId : undefined;
     if (!userId) return;
 
+    console.log(`[diag][follow] stage=entry`);
     console.log(`[follow] userId=${userId} lineAccountId=${lineAccountId}`);
 
     // プロフィール取得 & 友だち登録/更新
@@ -255,6 +256,7 @@ async function handleEvent(
     const referralRoute: EntryRoute | null = friendRefCode
       ? await getEntryRouteByRefCode(db, friendRefCode)
       : null;
+    console.log(`[diag][follow] stage=referral-resolved friendId=${friend.id} ref=${friendRefCode ?? ''} routeId=${referralRoute?.id ?? ''} tagId=${referralRoute?.tag_id ?? ''}`);
     const runAccountScenarios =
       !referralRoute || referralRoute.run_account_friend_add_scenarios !== 0;
 

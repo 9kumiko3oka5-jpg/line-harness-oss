@@ -1251,6 +1251,7 @@ liffRoutes.post('/api/liff/link', async (c) => {
     const db = c.env.DB;
     const friend = await getFriendByLineUserId(db, lineUserId);
     if (!friend) {
+      console.log(`[diag][liff-link] stage=friend-not-found ref=${body.ref ?? ''}`);
       return c.json({ success: false, error: 'Friend not found' }, 404);
     }
 
