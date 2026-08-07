@@ -4,6 +4,25 @@
 技術的な文脈を共有するための記録。更新時は日付を追記し、古い情報は削除せず
 「解決済み」「対応不要になった」等を明記して残す。
 
+## 2026-08-07: 本家(Shudesu/line-harness-oss)との差分調査メモ — マージ等は未実施、今後の別プロジェクトとして検討
+
+- **目的**: 本家(`upstream`リモート、`Shudesu/line-harness-oss`)がこのフォークに対してどれだけ更新されているかを`git fetch upstream`と`git log main..upstream/main`で確認した。**この日はfetchと差分確認のみを行い、マージ・pull・cherry-pickは一切実施していない。**
+- **バージョン差**: このフォーク(`apps/worker/package.json`)は`v0.15.0`のまま。本家の最新リリースコミットは`v0.19.0`(`353bc36 chore: release v0.19.0`)。フォーク側が本家より遅れている状態。
+- **差分規模**: `git log main..upstream/main --oneline`で**37コミット**未取り込み。`git diff --stat`では**133ファイル変更、+19,441行 / -2,681行**と非常に大きい。ウェビナー機能・アフィリエイト(ASP)機能・LINE APIプロキシなど、本家側で複数の大型機能が追加されている。
+- **取り込む価値がありそうなバグ修正**(内容確認のみ、未着手):
+  - `6be3b7c`: OAuth stateのエンコードがUTF-8非対応で、日本語UTMパラメータ付きだと`/auth/line`が500になる不具合の修正。
+  - `b4d62af`: `/r/:ref`とQR用URLで広告クリックID(gclid/fbclid等)とUTMパラメータが黙って欠落する不具合の修正。
+  - `07f7fb0`: 管理画面デプロイCIで`update-engine`のビルド漏れを直す修正。
+  - `d70bf5b` / `016375e`: インストーラー・CLIの管理者認証Secret検証まわりの修正。
+- **このフォークの独自カスタマイズと衝突リスクが高い箇所**:
+  - **マイグレーション番号046の衝突(確定)**: 本家側にも`046_affiliate_links.sql`と`046_link_tracking_controls.sql`の2ファイルが既に存在する。このフォークが今回追加した`046_pending_ref_attribution.sql`と番号がぶつかる。マージする場合は採番のやり直しと、本番`_migrations`テーブルの実データ再確認が必須(過去の`037`番衝突と同種の問題、本ファイル該当箇所参照)。
+  - `e989555`(instant first-step push統合): `applyRefAttribution`関数・followハンドラのfriend_add処理・referral-route enrollment・`on_reach_tag_id`のタグ付与を大きく書き換えている。今回このフォークで実施した`webhook.ts`/`liff.ts`のfollow処理・タグ付与修正(`pending_ref_attribution`方式)と同じ箇所を触っており、最も衝突リスクが高い。
+  - `webhook.ts`(+402行相当の差分)・`liff.ts`(+628行相当の差分)全体が本家側で大きく書き換わっている。
+  - `892c669`(LINE APIプロキシ+tracked-links重複排除+タグページ): entry_routes/tagまわりのカスタマイズと重なる。
+  - `friend-tag-attach.ts`: 上記`e989555`・アフィリエイト機能・LINEプロキシ同期の複数コミットで変更されている。
+  - `line-accounts.ts`(DB/route両方): マルチアカウント関連。このプロジェクトの現行運用では未使用だが、コード自体は共通のため影響しうる。
+- **今後の扱い**: 今回は状況把握のみ。マージ・cherry-pick等の判断は、今回の`pending_ref_attribution`修正の実機効果確認が済んだ後、**別プロジェクトとして**あらためて検討する。着手前には本ファイルのこのエントリを再確認すること。
+
 ## 2026-08-07: 流入元タグ不具合(osaka-yuka-form) — 原因確定・修正実装・本番デプロイ完了、実機の最終確認は次の自然な申込み時に実施予定
 
 - **対象**: 本ファイル下部の`2026-08-05: 第三者端末での実機確認と流入元タグ問題`エントリの続報。当時は原因未確定だった`osaka-yuka-form`の流入元タグ不自動付与の原因を特定し、修正を本番デプロイした。
