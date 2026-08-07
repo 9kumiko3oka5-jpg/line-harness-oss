@@ -18,6 +18,7 @@ import {
   getTrackedLinkById,
   getMessageTemplateById,
   jstNow,
+  savePendingRefAttribution,
 } from '@line-crm/db';
 import { buildIntroMessage } from '../services/intro-message.js';
 import { safeRedirectTarget } from '../lib/safe-redirect.js';
@@ -1252,6 +1253,18 @@ liffRoutes.post('/api/liff/link', async (c) => {
     const friend = await getFriendByLineUserId(db, lineUserId);
     if (!friend) {
       console.log(`[diag][liff-link] stage=friend-not-found ref=${body.ref ?? ''}`);
+      // friend レコードがまだ無い = follow webhook がまだ届いていない可能性。
+      // ref を保留テーブルに退避し、follow webhook 側で friend 作成直後に
+      // 回収できるようにする(短いリトライでは対応できない、数十秒以上の
+      // ギャップに対応するための仕組み)。xh: は使い捨てトークンなので、
+      // 他の ref_code 保存箇所と同様に対象外。
+      if (body.ref && !body.ref.startsWith('xh:')) {
+        try {
+          await savePendingRefAttribution(db, { lineUserId, refCode: body.ref });
+        } catch (err) {
+          console.error('[liff-link] savePendingRefAttribution failed', err);
+        }
+      }
       return c.json({ success: false, error: 'Friend not found' }, 404);
     }
 

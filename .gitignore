@@ -16,3 +16,4 @@ apps/worker/dist/
 .worktrees/
 .claude/worktrees/
 *.tsbuildinfo
+diag-log.txt

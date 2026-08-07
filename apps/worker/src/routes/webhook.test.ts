@@ -29,6 +29,7 @@ vi.mock('@line-crm/db', () => ({
   getEntryRouteByRefCode: vi.fn(),
   getMessageTemplateById: vi.fn(),
   getFriendById: vi.fn(),
+  consumePendingRefAttribution: vi.fn().mockResolvedValue(null),
 }));
 
 vi.mock('@line-crm/line-sdk', async () => {
@@ -56,8 +57,10 @@ import {
   advanceFriendScenario,
   completeFriendScenario,
   computeNextDeliveryAt,
+  consumePendingRefAttribution,
   enrollFriendInScenario,
   getEntryRouteByRefCode,
+  getFriendById,
   getFriendByLineUserId,
   getLineAccounts,
   getMessageTemplateById,
@@ -774,5 +777,215 @@ describe('POST /webhook — follow event referral intro push', () => {
     expect(getMessageTemplateById).not.toHaveBeenCalled();
     expect(lineClientMocks.pushMessage).not.toHaveBeenCalled();
     expect(stmt.run).not.toHaveBeenCalled();
+  });
+
+  describe('referral tag attach', () => {
+    const referralRouteWithTag = { ...referralRoute, tag_id: 'tag-1' };
+
+    test('referralRoute.tag_id がある場合 addTagToFriend が呼ばれる', async () => {
+      vi.mocked(verifySignature).mockResolvedValue(true);
+      vi.mocked(jstNow).mockReturnValue('2026-07-23T17:17:59.457+09:00');
+      mockFollowFriend();
+      vi.mocked(getEntryRouteByRefCode).mockResolvedValue(referralRouteWithTag);
+      vi.mocked(getScenarios).mockResolvedValue([]);
+      lineClientMocks.getProfile.mockResolvedValue({
+        userId: 'U-follow',
+        displayName: 'FUSAE',
+        pictureUrl: null,
+        statusMessage: null,
+      });
+
+      const stmt = {
+        bind: vi.fn(),
+        run: vi.fn().mockResolvedValue({}),
+        all: vi.fn().mockResolvedValue({ results: [] }),
+        // Treat intro as already-sent so this test isolates the tag-attach
+        // assertion from the intro-push dedupe logic covered above.
+        first: vi.fn().mockResolvedValue({ 1: 1 }),
+      };
+      stmt.bind.mockReturnValue(stmt);
+      const db = { prepare: vi.fn().mockReturnValue(stmt) } as unknown as D1Database;
+
+      const res = await runFollowEvent(db);
+
+      expect(res.status).toBe(200);
+      expect(addTagToFriend).toHaveBeenCalledWith(db, 'friend-2', 'tag-1');
+    });
+
+    test('referralRoute.tag_id が null なら addTagToFriend は呼ばれない', async () => {
+      vi.mocked(verifySignature).mockResolvedValue(true);
+      vi.mocked(jstNow).mockReturnValue('2026-07-23T17:17:59.457+09:00');
+      mockFollowFriend();
+      vi.mocked(getEntryRouteByRefCode).mockResolvedValue(referralRoute); // tag_id: null
+      vi.mocked(getScenarios).mockResolvedValue([]);
+      lineClientMocks.getProfile.mockResolvedValue({
+        userId: 'U-follow',
+        displayName: 'FUSAE',
+        pictureUrl: null,
+        statusMessage: null,
+      });
+
+      const stmt = {
+        bind: vi.fn(),
+        run: vi.fn().mockResolvedValue({}),
+        all: vi.fn().mockResolvedValue({ results: [] }),
+        first: vi.fn().mockResolvedValue({ 1: 1 }),
+      };
+      stmt.bind.mockReturnValue(stmt);
+      const db = { prepare: vi.fn().mockReturnValue(stmt) } as unknown as D1Database;
+
+      const res = await runFollowEvent(db);
+
+      expect(res.status).toBe(200);
+      expect(addTagToFriend).not.toHaveBeenCalled();
+    });
+
+    test('addTagToFriend が失敗しても intro push は継続する', async () => {
+      vi.mocked(verifySignature).mockResolvedValue(true);
+      vi.mocked(jstNow).mockReturnValue('2026-07-23T17:17:59.457+09:00');
+      mockFollowFriend();
+      vi.mocked(getEntryRouteByRefCode).mockResolvedValue(referralRouteWithTag);
+      vi.mocked(getScenarios).mockResolvedValue([]);
+      vi.mocked(getMessageTemplateById).mockResolvedValue(template);
+      vi.mocked(buildMessage).mockReturnValue({ type: 'text', text: 'ようこそ！' });
+      vi.mocked(messageToLogPayload).mockReturnValue({ messageType: 'text', content: 'ようこそ！' });
+      vi.mocked(addTagToFriend).mockRejectedValue(new Error('tag attach failed'));
+      lineClientMocks.getProfile.mockResolvedValue({
+        userId: 'U-follow',
+        displayName: 'FUSAE',
+        pictureUrl: null,
+        statusMessage: null,
+      });
+
+      const stmt = {
+        bind: vi.fn(),
+        run: vi.fn().mockResolvedValue({}),
+        all: vi.fn().mockResolvedValue({ results: [] }),
+        // No prior entry_route_intro row — the push must still proceed even
+        // though the tag attach right before it threw.
+        first: vi.fn().mockResolvedValue(null),
+      };
+      stmt.bind.mockReturnValue(stmt);
+      const db = { prepare: vi.fn().mockReturnValue(stmt) } as unknown as D1Database;
+
+      const res = await runFollowEvent(db);
+
+      expect(res.status).toBe(200);
+      expect(lineClientMocks.pushMessage).toHaveBeenCalledWith('U-follow', [{ type: 'text', text: 'ようこそ！' }]);
+    });
+  });
+
+  describe('pending ref attribution recovery', () => {
+    function mockFollowFriendNoRef() {
+      const friend = {
+        id: 'friend-3',
+        line_user_id: 'U-follow',
+        display_name: 'FUSAE',
+        picture_url: null,
+        status_message: null,
+        is_following: 1,
+        user_id: null,
+        line_account_id: null,
+        metadata: '{}',
+        first_tracked_link_id: null,
+        created_at: '2026-08-06T22:15:15.859+09:00',
+        updated_at: '2026-08-06T22:15:15.859+09:00',
+        // Neither /auth/callback nor /api/liff/link's happy path wrote
+        // ref_code before this webhook ran — the getFriendById retry below
+        // also comes back empty, so pending-ref-attribution is the only
+        // remaining source.
+        ref_code: null,
+      } as unknown as Awaited<ReturnType<typeof upsertFriend>>;
+      vi.mocked(upsertFriend).mockResolvedValue(friend);
+      return friend;
+    }
+
+    test('friend.ref_code が空 + 短いリトライも空 → consumePendingRefAttribution から回収し、タグが付く', async () => {
+      vi.mocked(verifySignature).mockResolvedValue(true);
+      vi.mocked(jstNow).mockReturnValue('2026-07-23T17:17:59.457+09:00');
+      const friend = mockFollowFriendNoRef();
+      vi.mocked(getFriendById).mockResolvedValue({ ...friend, ref_code: null });
+      vi.mocked(consumePendingRefAttribution).mockResolvedValue({ refCode: 'osaka-yuka-form' });
+      vi.mocked(getEntryRouteByRefCode).mockResolvedValue({ ...referralRoute, tag_id: 'tag-1' });
+      vi.mocked(getScenarios).mockResolvedValue([]);
+      lineClientMocks.getProfile.mockResolvedValue({
+        userId: 'U-follow',
+        displayName: 'FUSAE',
+        pictureUrl: null,
+        statusMessage: null,
+      });
+
+      const stmt = {
+        bind: vi.fn(),
+        run: vi.fn().mockResolvedValue({}),
+        all: vi.fn().mockResolvedValue({ results: [] }),
+        first: vi.fn().mockResolvedValue({ 1: 1 }),
+      };
+      stmt.bind.mockReturnValue(stmt);
+      const db = { prepare: vi.fn().mockReturnValue(stmt) } as unknown as D1Database;
+
+      const res = await runFollowEvent(db);
+
+      expect(res.status).toBe(200);
+      expect(consumePendingRefAttribution).toHaveBeenCalledWith(db, 'U-follow');
+      expect(getEntryRouteByRefCode).toHaveBeenCalledWith(db, 'osaka-yuka-form');
+      expect(addTagToFriend).toHaveBeenCalledWith(db, 'friend-3', 'tag-1');
+    }, 10000);
+
+    test('friend.ref_code が既に設定済みなら consumePendingRefAttribution は呼ばれない', async () => {
+      vi.mocked(verifySignature).mockResolvedValue(true);
+      vi.mocked(jstNow).mockReturnValue('2026-07-23T17:17:59.457+09:00');
+      mockFollowFriend(); // ref_code: 'osaka-yuka-form' already set
+      vi.mocked(getEntryRouteByRefCode).mockResolvedValue(referralRoute);
+      vi.mocked(getScenarios).mockResolvedValue([]);
+      lineClientMocks.getProfile.mockResolvedValue({
+        userId: 'U-follow',
+        displayName: 'FUSAE',
+        pictureUrl: null,
+        statusMessage: null,
+      });
+
+      const stmt = {
+        bind: vi.fn(),
+        run: vi.fn().mockResolvedValue({}),
+        all: vi.fn().mockResolvedValue({ results: [] }),
+        first: vi.fn().mockResolvedValue({ 1: 1 }),
+      };
+      stmt.bind.mockReturnValue(stmt);
+      const db = { prepare: vi.fn().mockReturnValue(stmt) } as unknown as D1Database;
+
+      const res = await runFollowEvent(db);
+
+      expect(res.status).toBe(200);
+      expect(consumePendingRefAttribution).not.toHaveBeenCalled();
+    });
+
+    test('consumePendingRefAttribution が失敗しても友だち登録処理は継続する', async () => {
+      vi.mocked(verifySignature).mockResolvedValue(true);
+      vi.mocked(jstNow).mockReturnValue('2026-07-23T17:17:59.457+09:00');
+      const friend = mockFollowFriendNoRef();
+      vi.mocked(getFriendById).mockResolvedValue({ ...friend, ref_code: null });
+      vi.mocked(consumePendingRefAttribution).mockRejectedValue(new Error('D1 down'));
+      vi.mocked(getScenarios).mockResolvedValue([]);
+      lineClientMocks.getProfile.mockResolvedValue({
+        userId: 'U-follow',
+        displayName: 'FUSAE',
+        pictureUrl: null,
+        statusMessage: null,
+      });
+
+      const stmt = {
+        bind: vi.fn(),
+        run: vi.fn().mockResolvedValue({}),
+        all: vi.fn().mockResolvedValue({ results: [] }),
+        first: vi.fn().mockResolvedValue(null),
+      };
+      stmt.bind.mockReturnValue(stmt);
+      const db = { prepare: vi.fn().mockReturnValue(stmt) } as unknown as D1Database;
+
+      const res = await runFollowEvent(db);
+
+      expect(res.status).toBe(200);
+    }, 10000);
   });
 });

@@ -240,7 +240,7 @@ async function handleEvent(
     // delivers the event. Retry a few times (~1s total) before giving up,
     // otherwise override mode and intro pushes silently fall back to the
     // account default whenever the webhook wins the race.
-    const { getFriendById } = await import('@line-crm/db');
+    const { getFriendById, consumePendingRefAttribution } = await import('@line-crm/db');
     let friendRefCode = (friend as { ref_code?: string | null }).ref_code ?? null;
     if (!friendRefCode) {
       for (let attempt = 0; attempt < 5; attempt++) {
@@ -251,6 +251,24 @@ async function handleEvent(
           friendRefCode = refreshedRef;
           break;
         }
+      }
+    }
+    // Still nothing after the short retry — check whether /api/liff/link
+    // stashed a ref before this friend row existed (2026-08-06 diagnostic
+    // test measured a ~10s gap between that call and this webhook, which
+    // the ~1s retry above cannot bridge). first-touch: only write if
+    // ref_code is still unset.
+    if (!friendRefCode) {
+      try {
+        const pending = await consumePendingRefAttribution(db, userId);
+        if (pending) {
+          await db.prepare('UPDATE friends SET ref_code = ? WHERE id = ? AND ref_code IS NULL')
+            .bind(pending.refCode, friend.id).run();
+          friendRefCode = pending.refCode;
+          console.log(`[follow] recovered pending ref_code for friend ${friend.id}`);
+        }
+      } catch (err) {
+        console.error('[follow] consumePendingRefAttribution failed', err);
       }
     }
     const referralRoute: EntryRoute | null = friendRefCode
@@ -351,6 +369,22 @@ async function handleEvent(
 
     // Referral link side-effects (intro push + dedicated scenario)
     if (referralRoute) {
+      // Tag attach from the referral link itself (entry_routes.tag_id).
+      // Until now, applyRefAttribution() in liff.ts was the ONLY place this
+      // got applied (called from /auth/callback and /api/liff/link).
+      // Friends whose ref only ever resolves here — via this follow webhook,
+      // including via the pending-ref-attribution recovery above — never
+      // got tagged. INSERT OR IGNORE makes this safe against duplicate
+      // follow events.
+      if (referralRoute.tag_id) {
+        try {
+          await addTagToFriend(db, friend.id, referralRoute.tag_id);
+          console.log(`[follow] referral tag attached tagId=${referralRoute.tag_id}`);
+        } catch (err) {
+          console.error('[follow] referral tag attach failed', err);
+        }
+      }
+
       // Intro push from referral link.
       // /auth/callback (applyRefAttribution in liff.ts) sends this same push
       // when the OAuth flow resolves ref_code before this follow webhook does

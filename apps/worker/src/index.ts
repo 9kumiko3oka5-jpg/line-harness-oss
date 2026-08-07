@@ -672,6 +672,21 @@ async function scheduled(
     }
   }
 
+  // Pending ref attribution cleanup — 6h cron tick. Deletes rows nobody
+  // ever consumed (LIFF hit /api/liff/link but the user never actually
+  // added the OA as a friend within 24h).
+  if (event.cron === '0 */6 * * *') {
+    try {
+      const { deleteExpiredPendingRefAttributions } = await import('@line-crm/db');
+      const deleted = await deleteExpiredPendingRefAttributions(env.DB);
+      if (deleted > 0) {
+        console.log(`[pending-ref-attribution] cleaned up expired=${deleted}`);
+      }
+    } catch (e) {
+      console.error('pending-ref-attribution cleanup error:', e);
+    }
+  }
+
   // Cross-account duplicate detection — disabled.
   // The cron used to materialize duplicates into the tag system but the 1k-subrequest
   // budget can't drain a 1k+ candidate backlog, and a live SELECT against

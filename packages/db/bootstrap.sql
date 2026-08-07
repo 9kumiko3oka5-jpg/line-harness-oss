@@ -560,6 +560,13 @@ CREATE TABLE outgoing_webhooks (
   updated_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now', '+9 hours'))
 );
 
+CREATE TABLE pending_ref_attribution (
+  id TEXT PRIMARY KEY,
+  line_user_id TEXT NOT NULL,
+  ref_code TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+
 CREATE TABLE pool_accounts (
   id TEXT PRIMARY KEY,
   pool_id TEXT NOT NULL REFERENCES traffic_pools(id) ON DELETE CASCADE,
@@ -923,6 +930,9 @@ CREATE INDEX idx_messages_log_friend_source ON messages_log (friend_id, source);
 CREATE INDEX idx_notifications_created ON notifications (created_at);
 
 CREATE INDEX idx_notifications_status ON notifications (status);
+
+CREATE UNIQUE INDEX idx_pending_ref_attribution_line_user_id
+  ON pending_ref_attribution(line_user_id);
 
 CREATE INDEX idx_ref_tracking_friend ON ref_tracking (friend_id);
 
