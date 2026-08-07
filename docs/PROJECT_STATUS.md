@@ -4,6 +4,38 @@
 技術的な文脈を共有するための記録。更新時は日付を追記し、古い情報は削除せず
 「解決済み」「対応不要になった」等を明記して残す。
 
+## 2026-08-07: 流入元タグ不具合(osaka-yuka-form) — 原因確定・修正実装・本番デプロイ完了、実機の最終確認は次の自然な申込み時に実施予定
+
+- **対象**: 本ファイル下部の`2026-08-05: 第三者端末での実機確認と流入元タグ問題`エントリの続報。当時は原因未確定だった`osaka-yuka-form`の流入元タグ不自動付与の原因を特定し、修正を本番デプロイした。
+- **調査手順の概要**:
+  - `liff.ts`/`webhook.ts`のコードを読み、タグ付与・ref解決に関わる箇所を洗い出した。
+  - 個人情報を含まない診断用ログ（`[diag][liff-link] stage=friend-not-found`、`[diag][follow] stage=entry` / `stage=referral-resolved`。内容は内部UUID・ref値・処理段階名のみで、LINE userId等は含めない）を`liff.ts`1箇所・`webhook.ts`2箇所に追加してデプロイ（コミット`bc66190`）。
+  - 実機テスト1件（2026-08-06実施、第三者アカウント）の際に`wrangler tail`をファイル保存しながら実行し、その出力とD1の実データ（`friends`/`friend_tags`/`ref_tracking`テーブル）を突き合わせて原因を特定した。
+  - `wrangler tail`の生ログにはLINE userIdや位置情報などの個人情報が含まれるため、保存先ファイル（`apps/worker/diag-log.txt`）は`.gitignore`に追加し、リポジトリには一切コミットしていない。ローカルのみに保持し、実機での最終効果確認が取れ次第削除する方針。
+- **確定した原因**（推測ではなく、実機テストのログとD1実データで確認済み）:
+  1. LIFFフロントエンド（`apps/worker/src/client/main.ts`）は、LIFFページを開いた瞬間（＝ユーザーが「友だち追加」ボタンをタップする前）に`/api/liff/link`をref付きで呼んでいた。この時点では友だちレコードがまだ存在しないため`404 Friend not found`となり、フロントエンド側はこれをリトライしない（ベストエフォート仕様、失敗を握りつぶして先に進む）。
+  2. 実際のfollow webhookが友だちレコードを作成するまでの時間差は、実機テストで約10秒だった。`webhook.ts`の既存の`ref_code`再試行（最大5回×200ms≒最大1秒）ではこのギャップに対応できない。
+  3. さらに`webhook.ts`のfollowハンドラは、`referralRoute`が解決できた場合でも`entry_routes.tag_id`をタグとして付与する処理自体を持っていなかった（タグ付与は`liff.ts`の`applyRefAttribution`関数のみが行っており、`/auth/callback`と`/api/liff/link`からしか呼ばれない構造だった）。
+  - 実機テストでは、`/api/liff/link`が`/webhook`より約10秒先行して404で終了し、`friends.ref_code`がNULLのまま、`friend_tags`も0件のままになることをD1の実データで確認した。
+- **修正内容**（コミット`7f9475e`、2026-08-07に`main`へマージ・本番デプロイ済み）:
+  - 新テーブル`pending_ref_attribution`（マイグレーション`046_pending_ref_attribution.sql`）を追加。`/api/liff/link`が404の際、`{line_user_id, ref_code}`を一時保存する（first-touch wins、24時間で期限切れ、`line_user_id`以外の個人情報は含めない設計）。
+  - `packages/db/src/pending-ref-attribution.ts`に`savePendingRefAttribution` / `consumePendingRefAttribution` / `deleteExpiredPendingRefAttributions`を追加。
+  - `webhook.ts`のfollowハンドラに、既存の1秒リトライの後段として`consumePendingRefAttribution`による回収処理を追加（friend_code解決の優先順位: ①follow時点で既にref_code設定済み → ②既存の1秒リトライ → ③新規の保留テーブル回収。矛盾・二重処理が起きないことを実装前に確認済み）。
+  - 同ハンドラに`entry_routes.tag_id`を`addTagToFriend`で付与する処理を追加（webhook経由で`referralRoute`が解決された場合に今まで欠けていた処理）。
+  - 6時間ごとのcron（`apps/worker/src/index.ts`）に、誰にも回収されなかった保留行の期限切れ削除を接続。
+  - 検討したが不採用にした案: `/api/liff/link`側での短い（最大1秒）リトライのみでの対応。実測10秒差を救えないため見送った。
+- **テスト**: `packages/db/test/pending-ref-attribution.test.ts`（新規6件）、`apps/worker/src/routes/liff.test.ts`（新規4件、このファイル自体が今回新規作成）、`apps/worker/src/routes/webhook.test.ts`（追記6件）。`tsc --noEmit`・`vitest run`（`packages/db`・`apps/worker`両方）・`pnpm run build`、いずれも成功を確認済み。
+- **本番反映状況**（実データで確認済み）:
+  - コミット`7f9475e`を`main`へpush済み。GitHub Actions `Deploy Cloudflare Worker`が成功し、workflow内の`Run pending D1 migrations` → `Build Worker and LIFF assets` → `Deploy to Cloudflare Workers`の順で完走したことをジョブのステップ一覧で確認した。
+  - 本番D1の`_migrations`テーブルに`046_pending_ref_attribution.sql`が記録済み（`applied_at: 2026-08-07 05:46:59`）、`pending_ref_attribution`テーブルの実在も`sqlite_master`で確認した。
+  - 本番Worker `/`はHTTP 200、大阪LINEグループ用・大阪一般用・東京一般用の3導線ともLIFF URL生成（クエリ形式、`46060f6`のリダイレクトループ修正）に影響がないことを機械確認した。
+- **未解決・残作業**:
+  - 実機での最終効果確認（実際に`osaka-yuka-form`経由で申込みがあった際にタグが付くかどうか）はまだ実施していない。日程調整はせず、**次に`osaka-yuka-form`経由で自然に申込みが発生したタイミング**で確認する方針（2026-08-07時点の決定）。
+  - 調査用に追加した診断ログ（`[diag][liff-link] stage=friend-not-found`、`[diag][follow] stage=entry` / `stage=referral-resolved`）は、上記の効果確認が取れるまで**意図的に残している**。効果確認後、削除専用の別コミットで対応する。
+  - `apps/worker/diag-log.txt`（`.gitignore`済み、個人情報を含むためコミット・共有しない）も、効果確認後に削除予定。
+  - Googleフォームの「不具合対応中」案内文の削除はリポジトリ外の作業としてユーザー側で対応予定（このリポジトリのコード変更は不要）。
+  - 利用者名、LINE userId、アクセストークン、Secretsなどの個人情報・機密情報はこのエントリにも記録していない。
+
 ## 2026-08-05: LIFF紹介導線のリダイレクトループを修正・本番Deploy済み
 
 - **対象**:
@@ -67,6 +99,10 @@
   - LIFF処理と友だち追加Webhookの実行順序による競合。
 - Googleフォームからの公式LINE誘導は、安全確認が完了するまで停止中である。
 - 利用者名、LINE userId、アクセストークン、Secretsなどの個人情報・機密情報は記録しない。
+- **2026-08-07追記**: 原因確定・修正実装・本番デプロイ完了。詳細は本ファイル最上部の
+  `2026-08-07: 流入元タグ不具合(osaka-yuka-form) — 原因確定・修正実装・本番デプロイ完了`
+  エントリを参照。実機での最終効果確認は未実施で、次にosaka-yuka-form経由で自然に
+  申込みが発生したタイミングで行う方針。
 
 ## 2026-08-03: LIFF「読み込み中」停止問題 → GitHub Actions設定補完と新LIFFで復旧確認済み
 
