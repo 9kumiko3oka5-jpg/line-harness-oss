@@ -17,3 +17,4 @@ apps/worker/dist/
 .claude/worktrees/
 *.tsbuildinfo
 diag-log.txt
+.playwright-mcp/
