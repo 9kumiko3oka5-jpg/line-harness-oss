@@ -24,6 +24,19 @@ import { buildIntroMessage } from '../services/intro-message.js';
 import { safeRedirectTarget } from '../lib/safe-redirect.js';
 import type { Env } from '../index.js';
 
+
+// OAuth state base64 helpers. btoa() only accepts Latin-1, so a single
+// multibyte query param (e.g. utm_campaign=夏キャンペーン) used to throw
+// InvalidCharacterError and turn the whole /auth/line request into a 500.
+// Encode via UTF-8 bytes instead. decodeState is byte-compatible with
+// states produced by the old plain btoa (ASCII-only payloads).
+function encodeState(state: string): string {
+  return btoa(String.fromCharCode(...new TextEncoder().encode(state)));
+}
+function decodeState(encoded: string): string {
+  return new TextDecoder().decode(Uint8Array.from(atob(encoded), (ch) => ch.charCodeAt(0)));
+}
+
 const liffRoutes = new Hono<Env>();
 
 // Persist ig_igsid on the LINE friend and notify IG Harness.
@@ -446,7 +459,7 @@ liffRoutes.get('/auth/line', async (c) => {
   // Without these, the form falls back to the gateId baked into the form's
   // onSubmitWebhookUrl (which is stale when a form is reused across campaigns).
   const state = JSON.stringify({ ref, redirect, form: formId, gate: gateParam, xh: xhParam2, gclid, fbclid, twclid, ttclid, utmSource, utmMedium, utmCampaign, account: accountParam || poolAccount, uid: uidParam, ig: igParam });
-  const encodedState = btoa(state);
+  const encodedState = encodeState(state);
   const loginUrl = new URL('https://access.line.me/oauth2/v2.1/authorize');
   loginUrl.searchParams.set('response_type', 'code');
   loginUrl.searchParams.set('client_id', channelId);
@@ -626,7 +639,7 @@ liffRoutes.get('/auth/oauth', async (c) => {
     utmSource, utmMedium, utmCampaign,
     account: accountParam || poolAccount, uid: uidParam, ig: igParam,
   });
-  const encodedState = btoa(state);
+  const encodedState = encodeState(state);
   const loginUrl = new URL('https://access.line.me/oauth2/v2.1/authorize');
   loginUrl.searchParams.set('response_type', 'code');
   loginUrl.searchParams.set('client_id', channelId);
@@ -665,7 +678,7 @@ liffRoutes.get('/auth/callback', async (c) => {
   let uidParam = '';
   let igParam = '';
   try {
-    const parsed = JSON.parse(atob(stateParam));
+    const parsed = JSON.parse(decodeState(stateParam));
     ref = parsed.ref || '';
     redirect = parsed.redirect || '';
     formId = parsed.form || '';
