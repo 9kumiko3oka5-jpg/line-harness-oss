@@ -44,7 +44,16 @@
   全値が適用前後で完全一致(新規7列が追加され22列)。`integrity_check` ok、外部キー違反0。
   既存テーブルの件数変化は`auto_replies` 0→1のみ(067が組込みの「マイル」完全一致キーワード
   自動応答を`is_active=1`で投入)。書き出したファイルは個人情報を含むため検証後に削除済み。
-- **次のアクション**: 「マイル」自動応答を有効のままにするかユーザー判断、④確認手順書とローカル確認
+- **「マイル」自動応答**: ユーザー判断で、本番反映後に管理画面で無効化する(方針a)。
+- **④ローカル確認環境(同日構築)**: Worker=`apps/worker`で`npx wrangler dev --local --port 8787`、
+  管理画面=`apps/web`で`NEXT_PUBLIC_API_URL=http://localhost:8787 npx next dev --port 3001`。
+  `apps/worker/.dev.vars`(gitignore済み)はダミー値のみ(API_KEY=`local-test-key-20261018`、LINEトークン
+  はダミー、各URLはlocalhost、CF_API_TOKEN/OWNER_NOTIFY/LIFF/LINE Loginは未設定)。ローカルD1は
+  `bootstrap.sql`+架空データ(友だち30件、`line_user_id`は`Utest…`、line_accounts 0件)。
+  チャット送信APIを叩いてLINE APIが401で拒否し配信記録も残らないことを確認済み。
+  注意: `vite dev`だとViteのCORSがプリフライトに先に応答し`Allow-Credentials`が欠けてログイン不可
+  (ローカル開発サーバー固有、本番とは無関係)。ローカル確認は`wrangler dev`を使う。
+- **次のアクション(旧)**: 「マイル」自動応答を有効のままにするかユーザー判断、④確認手順書とローカル確認
   環境、⑤ユーザー確認、⑥本番反映(要OK。直前にfriends単独の書き出し・Time Travel時点・Worker
   バージョンIDを記録)。
 
