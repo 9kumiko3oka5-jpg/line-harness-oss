@@ -5,6 +5,9 @@ import { Hono } from 'hono';
 // friend-not-found -> pending-ref-attribution path, without touching real D1.
 vi.mock('@line-crm/db', () => ({
   getFriendByLineUserId: vi.fn(),
+  // /api/liff/link resolves the friend per account (upstream v0.24); every
+  // case here is the friend-not-found path.
+  getFriendByLineUserIdForAccount: vi.fn().mockResolvedValue(null),
   getLineAccounts: vi.fn().mockResolvedValue([]),
   savePendingRefAttribution: vi.fn().mockResolvedValue(undefined),
   // Unused by this endpoint's happy/404 paths under test, but imported by

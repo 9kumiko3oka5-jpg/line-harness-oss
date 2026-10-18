@@ -28,8 +28,8 @@ vi.mock('@line-crm/db', () => ({
   addTagToFriend: vi.fn(),
   getEntryRouteByRefCode: vi.fn(),
   getMessageTemplateById: vi.fn(),
-  getFriendById: vi.fn(),
   consumePendingRefAttribution: vi.fn().mockResolvedValue(null),
+  getTemplateById: vi.fn(),
 }));
 
 vi.mock('@line-crm/line-sdk', async () => {
@@ -43,11 +43,17 @@ vi.mock('@line-crm/line-sdk', async () => {
 
 vi.mock('../services/event-bus.js', () => ({
   fireEvent: vi.fn().mockResolvedValue(undefined),
+  logOutgoingMessage: vi.fn().mockResolvedValue(undefined),
+}));
+
+vi.mock('../services/local-line-proxy.js', () => ({
+  dispatchLineProxyLocally: vi.fn().mockResolvedValue(new Response(null, { status: 200 })),
 }));
 
 vi.mock('../services/step-delivery.js', () => ({
   buildMessage: vi.fn(),
   expandVariables: vi.fn(),
+  resolveMetadata: vi.fn(),
   messageToLogPayload: vi.fn(),
 }));
 
@@ -75,6 +81,7 @@ import {
 import { fireEvent } from '../services/event-bus.js';
 import { buildMessage, messageToLogPayload } from '../services/step-delivery.js';
 import { webhook } from './webhook.js';
+import type { Friend } from '@line-crm/db';
 
 function setupApp() {
   const app = new Hono();
@@ -188,6 +195,183 @@ describe('POST /webhook — DoS defenses (#104)', () => {
     expect(res.status).toBe(200);
     // Fast-rejected before any crypto / DB work.
     expect(verifySignature).not.toHaveBeenCalled();
+  });
+});
+
+describe('POST /webhook — postback events', () => {
+  test('fires postback_received with postback.data so IF-THEN automations run on rich menu taps', async () => {
+    vi.mocked(verifySignature).mockResolvedValue(true);
+    vi.mocked(jstNow).mockReturnValue('2026-07-19T12:00:00.000+09:00');
+    vi.mocked(getFriendByLineUserId).mockResolvedValue({
+      id: 'friend-1',
+      line_user_id: 'U-existing',
+      display_name: 'Existing Friend',
+      picture_url: null,
+      status_message: null,
+      is_following: 1,
+      user_id: null,
+      line_account_id: null,
+      metadata: '{}',
+      first_tracked_link_id: null,
+      created_at: '2026-07-19T12:00:00.000+09:00',
+      updated_at: '2026-07-19T12:00:00.000+09:00',
+    });
+
+    const stmt = {
+      bind: vi.fn(),
+      run: vi.fn().mockResolvedValue({}),
+      all: vi.fn().mockResolvedValue({ results: [] }), // no auto_reply match
+    };
+    stmt.bind.mockReturnValue(stmt);
+    const db = { prepare: vi.fn().mockReturnValue(stmt) } as unknown as D1Database;
+
+    const executionCtx = {
+      waitUntil: vi.fn(),
+      passThroughOnException: vi.fn(),
+      props: {},
+    } as unknown as ExecutionContext;
+
+    const app = setupApp();
+    const validShapedSignature = 'A'.repeat(43) + '=';
+    const res = await app.request(
+      '/webhook',
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Line-Signature': validShapedSignature,
+        },
+        body: JSON.stringify({
+          destination: 'bot',
+          events: [
+            {
+              type: 'postback',
+              replyToken: 'reply-token-postback',
+              postback: { data: 'tag:premium' },
+              timestamp: Date.now(),
+              source: { type: 'user', userId: 'U-existing' },
+              webhookEventId: 'event-postback-1',
+              deliveryContext: { isRedelivery: false },
+              mode: 'active',
+            },
+          ],
+        }),
+      },
+      { ...baseEnv, DB: db },
+      executionCtx,
+    );
+
+    expect(res.status).toBe(200);
+    const processing = vi.mocked(executionCtx.waitUntil).mock.calls[0]?.[0] as Promise<unknown>;
+    await processing;
+
+    // No auto-reply matched — the reply token must be handed to the event bus
+    // so automations can still use it for free reply delivery.
+    expect(fireEvent).toHaveBeenCalledWith(
+      db,
+      'postback_received',
+      {
+        friendId: 'friend-1',
+        eventData: { text: 'tag:premium', matched: false },
+        replyToken: 'reply-token-postback',
+      },
+      'env-default-token',
+      null,
+    );
+    expect(lineClientMocks.replyMessage).not.toHaveBeenCalled();
+  });
+
+  test('silent auto-reply rule suppresses the reply but still fires postback_received as matched', async () => {
+    vi.mocked(verifySignature).mockResolvedValue(true);
+    vi.mocked(jstNow).mockReturnValue('2026-07-19T12:00:00.000+09:00');
+    vi.mocked(getFriendByLineUserId).mockResolvedValue({
+      id: 'friend-1',
+      line_user_id: 'U-existing',
+      display_name: 'Existing Friend',
+      picture_url: null,
+      status_message: null,
+      is_following: 1,
+      user_id: null,
+      line_account_id: null,
+      metadata: '{}',
+      first_tracked_link_id: null,
+      created_at: '2026-07-19T12:00:00.000+09:00',
+      updated_at: '2026-07-19T12:00:00.000+09:00',
+    });
+
+    const stmt = {
+      bind: vi.fn(),
+      run: vi.fn().mockResolvedValue({}),
+      all: vi.fn().mockResolvedValue({
+        results: [
+          {
+            id: 'rule-1',
+            keyword: 'tag:premium',
+            match_type: 'exact',
+            response_type: 'silent',
+            response_content: '',
+            template_id: null,
+          },
+        ],
+      }),
+    };
+    stmt.bind.mockReturnValue(stmt);
+    const db = { prepare: vi.fn().mockReturnValue(stmt) } as unknown as D1Database;
+
+    const executionCtx = {
+      waitUntil: vi.fn(),
+      passThroughOnException: vi.fn(),
+      props: {},
+    } as unknown as ExecutionContext;
+
+    const app = setupApp();
+    const validShapedSignature = 'A'.repeat(43) + '=';
+    const res = await app.request(
+      '/webhook',
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Line-Signature': validShapedSignature,
+        },
+        body: JSON.stringify({
+          destination: 'bot',
+          events: [
+            {
+              type: 'postback',
+              replyToken: 'reply-token-postback',
+              postback: { data: 'tag:premium' },
+              timestamp: Date.now(),
+              source: { type: 'user', userId: 'U-existing' },
+              webhookEventId: 'event-postback-2',
+              deliveryContext: { isRedelivery: false },
+              mode: 'active',
+            },
+          ],
+        }),
+      },
+      { ...baseEnv, DB: db },
+      executionCtx,
+    );
+
+    expect(res.status).toBe(200);
+    const processing = vi.mocked(executionCtx.waitUntil).mock.calls[0]?.[0] as Promise<unknown>;
+    await processing;
+
+    // Silent rule: no reply sent, but matched=true and the unconsumed reply
+    // token still reaches the event bus (rich menu tap → silent + add_tag flow).
+    expect(lineClientMocks.replyMessage).not.toHaveBeenCalled();
+    expect(fireEvent).toHaveBeenCalledWith(
+      db,
+      'postback_received',
+      {
+        friendId: 'friend-1',
+        eventData: { text: 'tag:premium', matched: true },
+        replyToken: 'reply-token-postback',
+      },
+      'env-default-token',
+      null,
+    );
   });
 });
 
@@ -524,7 +708,7 @@ describe('POST /webhook — owner notification', () => {
       props: {},
     } as unknown as ExecutionContext;
 
-    return app
+    return Promise.resolve(app
       .request(
         '/webhook',
         {
@@ -534,8 +718,8 @@ describe('POST /webhook — owner notification', () => {
         },
         { ...env, DB: db },
         executionCtx,
-      )
-      .then(async (res) => {
+      ))
+      .then(async (res: Response) => {
         const processing = vi.mocked(executionCtx.waitUntil).mock.calls[0]?.[0] as Promise<unknown>;
         await processing;
         return res;
@@ -687,7 +871,7 @@ describe('POST /webhook — follow event referral intro push', () => {
       props: {},
     } as unknown as ExecutionContext;
 
-    return app
+    return Promise.resolve(app
       .request(
         '/webhook',
         {
@@ -697,8 +881,8 @@ describe('POST /webhook — follow event referral intro push', () => {
         },
         { ...baseEnv, DB: db },
         executionCtx,
-      )
-      .then(async (res) => {
+      ))
+      .then(async (res: Response) => {
         const processing = vi.mocked(executionCtx.waitUntil).mock.calls[0]?.[0] as Promise<unknown>;
         await processing;
         return res;
@@ -904,7 +1088,7 @@ describe('POST /webhook — follow event referral intro push', () => {
       vi.mocked(verifySignature).mockResolvedValue(true);
       vi.mocked(jstNow).mockReturnValue('2026-07-23T17:17:59.457+09:00');
       const friend = mockFollowFriendNoRef();
-      vi.mocked(getFriendById).mockResolvedValue({ ...friend, ref_code: null });
+      vi.mocked(getFriendById).mockResolvedValue({ ...friend, ref_code: null } as Friend);
       vi.mocked(consumePendingRefAttribution).mockResolvedValue({ refCode: 'osaka-yuka-form' });
       vi.mocked(getEntryRouteByRefCode).mockResolvedValue({ ...referralRoute, tag_id: 'tag-1' });
       vi.mocked(getScenarios).mockResolvedValue([]);
@@ -964,7 +1148,7 @@ describe('POST /webhook — follow event referral intro push', () => {
       vi.mocked(verifySignature).mockResolvedValue(true);
       vi.mocked(jstNow).mockReturnValue('2026-07-23T17:17:59.457+09:00');
       const friend = mockFollowFriendNoRef();
-      vi.mocked(getFriendById).mockResolvedValue({ ...friend, ref_code: null });
+      vi.mocked(getFriendById).mockResolvedValue({ ...friend, ref_code: null } as Friend);
       vi.mocked(consumePendingRefAttribution).mockRejectedValue(new Error('D1 down'));
       vi.mocked(getScenarios).mockResolvedValue([]);
       lineClientMocks.getProfile.mockResolvedValue({
