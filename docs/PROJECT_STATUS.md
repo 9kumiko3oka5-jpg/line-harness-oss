@@ -4,7 +4,7 @@
 技術的な文脈を共有するための記録。更新時は日付を追記し、古い情報は削除せず
 「解決済み」「対応不要になった」等を明記して残す。
 
-## 2026-10-18: 本家v0.24.2への全面追従(方針B)に着手 — マージ・テスト完了、本番未反映
+## 2026-10-18: 本家v0.24.2への全面追従(方針B) — 2026-10-20本番反映済み(実機確認は未実施)
 
 - **方針変更**: 9/4の3段階方針(A)から、ハッカソン(11/2〜)前にv0.24.2へ全面追従する方針(B)へ
   ユーザー合意のうえ切替。**10/28を判断日**とし、間に合わなければバックアップに戻してAへ切替。
@@ -59,7 +59,18 @@
   バージョン`48e32d86-be74-4966-b873-75e24f7143b2`(戻す場合: `npx wrangler rollback <ID> --name line-harness`)、
   本番`_migrations`52件・friends 26件(予行演習時と同一)。friends単独の書き出し(26行)はセッション用の
   一時領域に保存(個人情報のためリポジトリには置かない)。反映直前に worker `tsc` OK・vitest 1653/1653。
-  `upstream-sync/v0.24`をmainへマージしpush → GitHub Actionsで本番Deploy。結果はユーザーが画面で確認予定。
+  `upstream-sync/v0.24`をmainへマージしpush → GitHub Actionsで本番Deploy。
+  **結果**: ユーザーがActions画面で`Deploy Cloudflare Worker`・`Deploy Cloudflare Admin`の両方成功、
+  マイグレーション27件が`Applying`だったことを確認。反映後の本番確認(読み取りのみ): `_migrations`79件
+  (最新`072_health_logs_composite_index.sql`)、friends 26件で反映前の書き出しと全15列・全行が完全一致、
+  `PRAGMA foreign_key_check`違反0、新Workerバージョン`15b86fda-ad49-45f6-b58c-a972a53576e6`
+  (2026-10-20T07:15:41Z、100%)。
+- **「マイル」自動応答の無効化(2026-10-20完了)**: ユーザーが管理画面で無効化(管理画面ログインに
+  API Keyが必要なため、エージェントによるPlaywright操作は未実施)。本番D1で
+  `auto_replies.id='builtin-mileage-wallet-keyword'`が`is_active=0`であることを確認済み。
+  削除はしていない(本家の組込みデータのため、将来使う場合は管理画面で有効化できる)。
+- **未検証**: 反映後の実機確認(LIFF申込み・LINE受信・オーナー通知・ステップ配信・毎分の`TenantScheduler`
+  の動作ログ)はまだ行っていない。
 - **次のアクション(旧)**: 「マイル」自動応答を有効のままにするかユーザー判断、④確認手順書とローカル確認
   環境、⑤ユーザー確認、⑥本番反映(要OK。直前にfriends単独の書き出し・Time Travel時点・Worker
   バージョンIDを記録)。
