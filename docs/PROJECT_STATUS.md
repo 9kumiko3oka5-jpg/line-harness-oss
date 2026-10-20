@@ -53,6 +53,13 @@
   チャット送信APIを叩いてLINE APIが401で拒否し配信記録も残らないことを確認済み。
   注意: `vite dev`だとViteのCORSがプリフライトに先に応答し`Allow-Credentials`が欠けてログイン不可
   (ローカル開発サーバー固有、本番とは無関係)。ローカル確認は`wrangler dev`を使う。
+- **⑥本番反映(2026-10-20実施)**: 直前状態を記録 — 2026-10-20T07:10:02Z時点のD1 Time Travel
+  ブックマーク`0000e668-00000000-0000510a-7f3fc777ec9cc808d0bc6797baf960dc`
+  (戻す場合: `npx wrangler d1 time-travel restore line-crm --bookmark=<上記>`)、反映前のWorker
+  バージョン`48e32d86-be74-4966-b873-75e24f7143b2`(戻す場合: `npx wrangler rollback <ID> --name line-harness`)、
+  本番`_migrations`52件・friends 26件(予行演習時と同一)。friends単独の書き出し(26行)はセッション用の
+  一時領域に保存(個人情報のためリポジトリには置かない)。反映直前に worker `tsc` OK・vitest 1653/1653。
+  `upstream-sync/v0.24`をmainへマージしpush → GitHub Actionsで本番Deploy。結果はユーザーが画面で確認予定。
 - **次のアクション(旧)**: 「マイル」自動応答を有効のままにするかユーザー判断、④確認手順書とローカル確認
   環境、⑤ユーザー確認、⑥本番反映(要OK。直前にfriends単独の書き出し・Time Travel時点・Worker
   バージョンIDを記録)。
